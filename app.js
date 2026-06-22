@@ -40,6 +40,7 @@
   let lineClipboard = [];
   let focusedLineId = "";
   let bodySelection = null;
+  let bodySelectionRange = null;
   let hasPendingSave = false;
   let saveTimer = 0;
   let renderTimer = 0;
@@ -67,6 +68,7 @@
     els.bodyBoldButton = document.getElementById("bodyBoldButton");
     els.bodyColorInput = document.getElementById("bodyColorInput");
     els.bodyColorClearButton = document.getElementById("bodyColorClearButton");
+    els.formatStatus = document.getElementById("formatStatus");
     els.copyLinesButton = document.getElementById("copyLinesButton");
     els.cutLinesButton = document.getElementById("cutLinesButton");
     els.pasteLinesButton = document.getElementById("pasteLinesButton");
@@ -104,6 +106,7 @@
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") hideSpeakerPicker();
     });
+    document.addEventListener("selectionchange", updateBodySelectionFromDocument);
     window.addEventListener("resize", hideSpeakerPicker);
     window.addEventListener("scroll", hideSpeakerPicker, true);
     window.addEventListener("beforeunload", flushPendingSave);
@@ -130,13 +133,11 @@
     els.copyLinesButton.addEventListener("click", copySelectedLines);
     els.cutLinesButton.addEventListener("click", cutSelectedLines);
     els.pasteLinesButton.addEventListener("click", pasteCopiedLines);
-    els.bodyBoldButton.addEventListener("mousedown", preserveBodySelectionForToolbar);
+    window.scriptEditorApplyBodyBold = applyBodyBoldFromPointer;
     els.bodyColorInput.addEventListener("mousedown", preserveBodySelectionForToolbar);
     els.bodyColorClearButton.addEventListener("mousedown", preserveBodySelectionForToolbar);
-    els.bodyBoldButton.addEventListener("click", () => {
-      applyBodyMark({ bold: true });
-      flushPendingSave();
-    });
+    els.bodyBoldButton.addEventListener("mousedown", applyBodyBoldFromPointer);
+    els.bodyBoldButton.addEventListener("click", (event) => event.preventDefault());
     els.bodyColorInput.addEventListener("input", () => applyBodyMark({ color: els.bodyColorInput.value }));
     els.bodyColorInput.addEventListener("change", flushPendingSave);
     els.bodyColorClearButton.addEventListener("click", () => {
@@ -415,15 +416,17 @@
       const bodyInput = document.createElement("div");
       bodyInput.className = `body-input ${line.type}`;
       bodyInput.contentEditable = "true";
+      bodyInput.setAttribute("role", "textbox");
+      bodyInput.setAttribute("aria-label", "本文");
       bodyInput.dataset.placeholder = "本文";
       bodyInput.innerHTML = bodyEditorHtml(line);
       bodyInput.addEventListener("input", () => {
-        line.body = bodyInput.innerText.replace(/\r?\n$/, "");
-        line.bodyMarks = extractBodyMarks(bodyInput, line.body.length);
+        syncBodyEditorToLine(bodyInput, line);
         line.type = inferType(line.speaker, line.body, line.type);
         if (shouldAutoRegisterSpeaker(line)) ensureSpeaker(line.speaker, undefined, true);
         pruneUnusedAutoSpeakers();
         syncRowVisual();
+        resizeBodyInput(bodyInput);
         renderSpeakers();
         renderStats();
         renderGoogleDocsPreview();
@@ -434,14 +437,20 @@
         flushPendingSave();
         focusedLineId = line.id;
         captureBodySelection(line.id, bodyInput);
+        resizeBodyInput(bodyInput);
         centerRowForEditing(row);
       });
+      bodyInput.addEventListener("beforeinput", () => captureBodySelection(line.id, bodyInput));
       bodyInput.addEventListener("blur", flushPendingSave);
       bodyInput.addEventListener("mouseup", () => captureBodySelection(line.id, bodyInput));
-      bodyInput.addEventListener("keyup", () => captureBodySelection(line.id, bodyInput));
+      bodyInput.addEventListener("keyup", () => {
+        captureBodySelection(line.id, bodyInput);
+        resizeBodyInput(bodyInput);
+      });
       bodyInput.addEventListener("paste", (event) => handleBodyPaste(event, index));
       bodyInput.addEventListener("keydown", (event) => handleRowKey(event, index, "body"));
       bodyCell.append(colon, bodyInput);
+      requestAnimationFrame(() => resizeBodyInput(bodyInput));
 
       const tools = document.createElement("div");
       tools.className = "row-tools";
@@ -465,8 +474,14 @@
         setOptionalCssVar(row, "--body-text", nextBodyColor);
         colon.textContent = line.speaker ? "：" : "";
         bodyInput.className = `body-input ${line.type}`;
+        if (document.activeElement !== bodyInput) bodyInput.innerHTML = bodyEditorHtml(line);
       }
     });
+  }
+
+  function resizeBodyInput(input) {
+    input.style.height = "auto";
+    input.style.height = `${input.scrollHeight}px`;
   }
 
   function centerRowForEditing(row) {
@@ -480,7 +495,7 @@
     if (!runs.length) return "";
     return runs.map((run) => {
       const styles = [];
-      if (run.bold) styles.push("font-weight:800");
+      if (run.bold) styles.push("font-weight:900");
       if (run.color) styles.push(`color:${run.color}`);
       const text = escapeHtml(run.text).replace(/\n/g, "<br>");
       return styles.length ? `<span style="${styles.join(";")}">${text}</span>` : text;
@@ -540,6 +555,29 @@
       .sort((a, b) => a.start - b.start || a.end - b.end);
   }
 
+  function syncBodyEditorToLine(editor, line) {
+    line.body = editorPlainText(editor);
+    line.bodyMarks = extractBodyMarks(editor, line.body.length);
+  }
+
+  function editorPlainText(root) {
+    let text = "";
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.nodeValue || "";
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.tagName === "BR") {
+        text += "\n";
+        return;
+      }
+      Array.from(node.childNodes).forEach(walk);
+    };
+    Array.from(root.childNodes).forEach(walk);
+    return text;
+  }
+
   function extractBodyMarks(root, textLength) {
     const marks = [];
     let offset = 0;
@@ -573,36 +611,57 @@
   }
 
   function captureBodySelection(lineId, editor) {
-    const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0) return;
-    const range = selection.getRangeAt(0);
-    if (!editor.contains(range.commonAncestorContainer)) return;
-    const start = selectionOffset(editor, range, true);
-    const end = selectionOffset(editor, range, false);
+    const offsets = selectionOffsetsForEditor(editor);
+    if (!offsets && (typeof editor.selectionStart !== "number" || typeof editor.selectionEnd !== "number")) return;
+    const start = offsets?.start ?? editor.selectionStart;
+    const end = offsets?.end ?? editor.selectionEnd;
     bodySelection = {
       lineId,
       start: Math.min(start, end),
       end: Math.max(start, end),
     };
+    bodySelectionRange = null;
+  }
+
+  function updateBodySelectionFromDocument() {
+    const selection = captureActiveBodySelection();
+    if (selection) bodySelection = selection;
   }
 
   function preserveBodySelectionForToolbar(event) {
-    const activeSelection = captureActiveBodySelection();
-    if (activeSelection) bodySelection = activeSelection;
+    updateBodySelectionFromDocument();
     if (event.currentTarget !== els.bodyColorInput) event.preventDefault();
   }
 
+  function applyBodyBoldFromPointer(event) {
+    if (event.__scriptEditorBodyBoldHandled) return;
+    event.__scriptEditorBodyBoldHandled = true;
+    updateBodySelectionFromDocument();
+    event.preventDefault();
+    const result = toggleBodyBoldSelection();
+    if (!result) {
+      setFormatStatus("本文を選択してください");
+      return;
+    }
+    setFormatStatus(result === "removed" ? "太字を解除しました" : "太字を適用しました");
+    flushPendingSave();
+  }
+
   function captureActiveBodySelection() {
-    const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0) return null;
-    const range = selection.getRangeAt(0);
-    const editor = closestBodyEditor(range.commonAncestorContainer);
+    const selection = document.getSelection?.();
+    const selectionEditor = selection?.rangeCount
+      ? closestBodyEditor(selection.anchorNode) || closestBodyEditor(selection.focusNode)
+      : null;
+    const activeEditor = document.activeElement?.classList?.contains("body-input") ? document.activeElement : null;
+    const editor = selectionEditor || activeEditor;
     if (!editor) return null;
     const row = editor.closest(".script-row");
     const lineId = row?.dataset.lineId;
     if (!lineId) return null;
-    const start = selectionOffset(editor, range, true);
-    const end = selectionOffset(editor, range, false);
+    const offsets = selectionOffsetsForEditor(editor);
+    if (!offsets && (typeof editor.selectionStart !== "number" || typeof editor.selectionEnd !== "number")) return null;
+    const start = offsets?.start ?? editor.selectionStart;
+    const end = offsets?.end ?? editor.selectionEnd;
     return {
       lineId,
       start: Math.min(start, end),
@@ -615,20 +674,160 @@
     return element?.closest?.(".body-input") || null;
   }
 
-  function selectionOffset(editor, range, useStart) {
-    const clone = range.cloneRange();
-    clone.selectNodeContents(editor);
-    clone.setEnd(useStart ? range.startContainer : range.endContainer, useStart ? range.startOffset : range.endOffset);
-    return clone.toString().length;
+  function selectionOffsetsForEditor(editor) {
+    const selection = document.getSelection?.();
+    if (!selection || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    if (!nodeBelongsToEditor(editor, range.startContainer) || !nodeBelongsToEditor(editor, range.endContainer)) return null;
+    const textLength = editorPlainText(editor).length;
+    return {
+      start: clampNumber(offsetForEditorPosition(editor, range.startContainer, range.startOffset), 0, textLength),
+      end: clampNumber(offsetForEditorPosition(editor, range.endContainer, range.endOffset), 0, textLength),
+    };
+  }
+
+  function nodeBelongsToEditor(editor, node) {
+    return node === editor || Boolean(editor.contains?.(node));
+  }
+
+  function offsetForEditorPosition(root, targetNode, targetOffset) {
+    let offset = 0;
+    let found = false;
+    const lengthOf = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return (node.nodeValue || "").length;
+      if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") return 1;
+      return Array.from(node.childNodes || []).reduce((total, child) => total + lengthOf(child), 0);
+    };
+    const walk = (node) => {
+      if (found) return;
+      if (node === targetNode) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          offset += targetOffset;
+        } else {
+          Array.from(node.childNodes || []).slice(0, targetOffset).forEach((child) => {
+            offset += lengthOf(child);
+          });
+        }
+        found = true;
+        return;
+      }
+      if (node.nodeType === Node.TEXT_NODE) {
+        offset += (node.nodeValue || "").length;
+        return;
+      }
+      if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") {
+        offset += 1;
+        return;
+      }
+      Array.from(node.childNodes || []).forEach(walk);
+    };
+    walk(root);
+    return offset;
   }
 
   function applyBodyMark(style) {
-    if (!bodySelection || bodySelection.start === bodySelection.end) return;
+    updateBodySelectionFromDocument();
+    if (!bodySelection || bodySelection.start === bodySelection.end) return false;
     const line = findLine(bodySelection.lineId);
-    if (!line) return;
+    if (!line) return false;
+    const selectionToRestore = { ...bodySelection };
     line.bodyMarks = applyMarkToRange(line.bodyMarks, line.body.length, bodySelection.start, bodySelection.end, style);
     renderAll();
+    restoreBodySelectionAfterRender(selectionToRestore);
     markSavePending();
+    return true;
+  }
+
+  function toggleBodyBoldSelection() {
+    updateBodySelectionFromDocument();
+    if (!bodySelection || bodySelection.start === bodySelection.end) return "";
+    const line = findLine(bodySelection.lineId);
+    if (!line) return "";
+    const removeBold = rangeIsFullyBold(line.bodyMarks, line.body.length, bodySelection.start, bodySelection.end);
+    return applyBodyMark({ bold: !removeBold }) ? (removeBold ? "removed" : "applied") : "";
+  }
+
+  function rangeIsFullyBold(marks, textLength, start, end) {
+    const normalized = normalizeBodyMarks(marks, textLength);
+    const clippedStart = clampNumber(start, 0, textLength);
+    const clippedEnd = clampNumber(end, 0, textLength);
+    if (clippedEnd <= clippedStart) return false;
+    const points = new Set([clippedStart, clippedEnd]);
+    normalized.forEach((mark) => {
+      if (mark.end > clippedStart && mark.start < clippedEnd) {
+        points.add(clampNumber(mark.start, clippedStart, clippedEnd));
+        points.add(clampNumber(mark.end, clippedStart, clippedEnd));
+      }
+    });
+    const ordered = Array.from(points).sort((a, b) => a - b);
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      const segmentStart = ordered[index];
+      const segmentEnd = ordered[index + 1];
+      if (segmentStart === segmentEnd) continue;
+      const isBold = normalized.some((mark) => mark.bold && mark.start < segmentEnd && mark.end > segmentStart);
+      if (!isBold) return false;
+    }
+    return true;
+  }
+
+  function restoreBodySelectionAfterRender(selection) {
+    const restore = () => {
+      const row = Array.from(els.scriptRows.querySelectorAll(".script-row")).find((item) => item.dataset.lineId === selection.lineId);
+      const editor = row?.querySelector(".body-input");
+      if (!editor) return false;
+      editor.focus({ preventScroll: true });
+      setEditorSelection(editor, selection.start, selection.end);
+      captureBodySelection(selection.lineId, editor);
+      return true;
+    };
+    if (restore()) {
+      requestAnimationFrame(restore);
+    } else {
+      requestAnimationFrame(restore);
+    }
+  }
+
+  function setEditorSelection(editor, start, end) {
+    const selection = document.getSelection?.();
+    if (!selection) return;
+    const range = document.createRange();
+    const startPosition = editorPositionForOffset(editor, start);
+    const endPosition = editorPositionForOffset(editor, end);
+    range.setStart(startPosition.node, startPosition.offset);
+    range.setEnd(endPosition.node, endPosition.offset);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function editorPositionForOffset(root, targetOffset) {
+    let offset = 0;
+    const target = Math.max(0, targetOffset);
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const length = (node.nodeValue || "").length;
+        if (target <= offset + length) return { node, offset: target - offset };
+        offset += length;
+        return null;
+      }
+      const children = Array.from(node.childNodes || []);
+      for (let index = 0; index < children.length; index += 1) {
+        const child = children[index];
+        if (child.nodeType === Node.ELEMENT_NODE && child.tagName === "BR") {
+          if (target <= offset + 1) return { node, offset: index + 1 };
+          offset += 1;
+          continue;
+        }
+        const found = walk(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(root) || { node: root, offset: root.childNodes.length };
+  }
+
+  function setFormatStatus(text) {
+    if (!els.formatStatus) return;
+    els.formatStatus.textContent = text;
   }
 
   function applyMarkToRange(marks, textLength, start, end, style) {

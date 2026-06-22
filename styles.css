@@ -369,18 +369,20 @@ button:hover,
   color: var(--body-text, var(--text));
   font-family: inherit;
   font-size: 16px;
-  font-weight: 600;
+  font-weight: 400;
   line-height: 1.55;
   outline: none;
   overflow: hidden;
   overflow-wrap: anywhere;
   padding: 6px 7px;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
-.body-input:empty::before {
+.body-input[contenteditable="true"]:empty::before {
+  color: #9aa8ba;
   content: attr(data-placeholder);
-  color: #94a3b8;
+  pointer-events: none;
 }
 
 .body-input:focus {
@@ -388,9 +390,14 @@ button:hover,
   background: #fbfdff;
 }
 
+.body-input span[style*="font-weight"] {
+  font-weight: 900 !important;
+  text-shadow: 0.02em 0 0 currentColor;
+}
+
 .body-input.direction {
   color: var(--body-text, #475569);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .body-input.sfx {
@@ -480,6 +487,13 @@ button:hover,
   border: 0;
   background: transparent;
   padding: 0;
+}
+
+.format-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  min-width: 8em;
 }
 
 .side-pane {

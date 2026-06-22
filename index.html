@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20260623-visiblebold1">
   </head>
   <body>
     <div class="app-shell">
@@ -54,12 +54,13 @@
           <div id="scriptRows" class="script-rows" aria-live="polite"></div>
           <div class="editor-footer">
             <div class="format-toolbar" aria-label="本文装飾">
-              <button id="bodyBoldButton" type="button" title="選択した本文を太字">B</button>
+              <button id="bodyBoldButton" type="button" title="選択した本文を太字" onmousedown="if (window.scriptEditorApplyBodyBold) { window.scriptEditorApplyBodyBold(event); } else { event.preventDefault(); document.execCommand('bold', false, null); }">B</button>
               <label class="format-color-control" title="選択した本文の色">
                 色
                 <input id="bodyColorInput" type="color" value="#dc2626" aria-label="選択した本文の色">
               </label>
               <button id="bodyColorClearButton" type="button">色を戻す</button>
+              <span id="formatStatus" class="format-status" aria-live="polite"></span>
             </div>
             <button id="addLineButton" type="button">行を追加</button>
             <button id="normalizeSpeakersButton" type="button">未登録話者を検出</button>
@@ -136,6 +137,6 @@
       </main>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=20260623-togglebold1"></script>
   </body>
 </html>
