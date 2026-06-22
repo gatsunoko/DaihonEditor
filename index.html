@@ -53,8 +53,19 @@
           </div>
           <div id="scriptRows" class="script-rows" aria-live="polite"></div>
           <div class="editor-footer">
+            <div class="format-toolbar" aria-label="本文装飾">
+              <button id="bodyBoldButton" type="button" title="選択した本文を太字">B</button>
+              <label class="format-color-control" title="選択した本文の色">
+                色
+                <input id="bodyColorInput" type="color" value="#dc2626" aria-label="選択した本文の色">
+              </label>
+              <button id="bodyColorClearButton" type="button">色を戻す</button>
+            </div>
             <button id="addLineButton" type="button">行を追加</button>
             <button id="normalizeSpeakersButton" type="button">未登録話者を検出</button>
+            <button id="copyLinesButton" type="button">選択行をコピー</button>
+            <button id="cutLinesButton" type="button">選択行をカット</button>
+            <button id="pasteLinesButton" type="button">貼り付け</button>
           </div>
         </section>
 
@@ -105,6 +116,20 @@
               <input id="exportBlankLineInput" type="checkbox">
               <span>台詞行の間に空行を入れる</span>
             </label>
+          </section>
+
+          <section class="panel compact">
+            <h2>Google Docs貼付け</h2>
+            <div class="paste-copy-actions">
+              <button id="copyGoogleDocsButton" type="button">リッチコピー</button>
+            </div>
+            <div id="googleDocsCopyStatus" class="status-line">下のプレビューを選択してコピーすることもできます。</div>
+            <div
+              id="googleDocsPreview"
+              class="docs-paste-preview"
+              contenteditable="true"
+              aria-label="Google Docs貼り付け用プレビュー"
+            ></div>
           </section>
 
         </aside>
