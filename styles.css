@@ -11,6 +11,7 @@
   --danger: #d14343;
   --shadow: 0 12px 38px rgba(27, 39, 55, 0.08);
   --row-height: 44px;
+  --sticky-sidebar-top: 82px;
   font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif;
 }
 
@@ -112,7 +113,7 @@ button:hover,
   grid-template-columns: 320px minmax(610px, 1fr) 330px;
   gap: 16px;
   flex: 1;
-  padding: 16px;
+  padding: 16px 16px min(42vh, 420px);
 }
 
 .editor-pane,
@@ -208,6 +209,7 @@ button:hover,
 .script-rows {
   overflow: auto;
   flex: 1;
+  scroll-padding-block: 42vh;
 }
 
 .script-row {
@@ -385,6 +387,12 @@ button:hover,
   display: flex;
   flex-direction: column;
   gap: 12px;
+  position: sticky;
+  top: var(--sticky-sidebar-top);
+  align-self: start;
+  max-height: calc(100vh - var(--sticky-sidebar-top) - 16px);
+  overflow: auto;
+  padding-bottom: 2px;
 }
 
 .panel {
@@ -523,7 +531,7 @@ button:hover,
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: calc(100vh - 186px);
+  max-height: calc(100vh - var(--sticky-sidebar-top) - 118px);
   overflow: auto;
 }
 

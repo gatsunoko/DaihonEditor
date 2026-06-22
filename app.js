@@ -90,6 +90,8 @@
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") hideSpeakerPicker();
     });
+    window.addEventListener("resize", hideSpeakerPicker);
+    window.addEventListener("scroll", hideSpeakerPicker, true);
 
     els.projectTitle.addEventListener("input", () => {
       project.title = els.projectTitle.value.trim() || "無題の台本";
@@ -349,6 +351,7 @@
         updateMatches();
         scheduleSave();
       });
+      bodyInput.addEventListener("focus", () => centerRowForEditing(row));
       bodyInput.addEventListener("paste", (event) => handlePaste(event, index));
       bodyInput.addEventListener("keydown", (event) => handleRowKey(event, index, "body"));
       bodyCell.append(colon, bodyInput);
@@ -384,6 +387,12 @@
   function resizeBodyInput(input) {
     input.style.height = "auto";
     input.style.height = `${input.scrollHeight}px`;
+  }
+
+  function centerRowForEditing(row) {
+    requestAnimationFrame(() => {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
   }
 
   function renderSpeakers() {
@@ -529,8 +538,20 @@
 
   function positionSpeakerPicker(picker, input) {
     const rect = input.getBoundingClientRect();
+    const margin = 8;
+    const gap = 4;
+    const spaceBelow = window.innerHeight - rect.bottom - margin;
+    const spaceAbove = rect.top - margin;
+    const desiredHeight = Math.min(picker.scrollHeight, 260);
+    const openAbove = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+    const maxHeight = Math.max(96, Math.min(260, openAbove ? spaceAbove - gap : spaceBelow - gap));
+    const actualHeight = Math.min(desiredHeight, maxHeight);
+
     picker.style.left = `${rect.left}px`;
-    picker.style.top = `${rect.bottom + 4}px`;
+    picker.style.maxHeight = `${maxHeight}px`;
+    picker.style.top = openAbove
+      ? `${Math.max(margin, rect.top - actualHeight - gap)}px`
+      : `${rect.bottom + gap}px`;
     picker.style.minWidth = `${rect.width}px`;
   }
 
