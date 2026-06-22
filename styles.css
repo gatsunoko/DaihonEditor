@@ -397,7 +397,6 @@ button:hover,
 
 .body-input.direction {
   color: var(--body-text, #475569);
-  font-weight: 500;
 }
 
 .body-input.sfx {
