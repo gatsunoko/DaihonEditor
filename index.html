@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css?v=20260623-visiblebold2">
+    <link rel="stylesheet" href="styles.css?v=20260623-left-drawer-fit1">
   </head>
   <body>
     <div class="app-shell">
@@ -14,6 +14,14 @@
           <div class="save-state" id="saveState">LocalStorageに自動保存済み</div>
         </div>
         <div class="toolbar" aria-label="ファイル操作">
+          <div class="view-toggles" aria-label="サイドバー表示">
+            <button id="toggleSpeakerPaneButton" class="sidebar-icon-button hamburger-toggle" type="button" aria-label="話者サイドバーを切り替え" aria-pressed="true">
+              <span class="hamburger-icon" aria-hidden="true"><span></span><span></span><span></span></span>
+            </button>
+            <button id="toggleSettingsPaneButton" class="sidebar-icon-button panel-toggle" type="button" aria-label="設定サイドバーを切り替え" aria-pressed="true">
+              <span class="panel-icon" aria-hidden="true"><span></span></span>
+            </button>
+          </div>
           <button id="newProjectButton" type="button">新規</button>
           <button id="saveJsonButton" type="button">JSON保存</button>
           <label class="file-button">
@@ -136,6 +144,6 @@
       </main>
     </div>
 
-    <script src="app.js?v=20260623-togglebold1"></script>
+    <script src="app.js?v=20260623-left-drawer-fit1"></script>
   </body>
 </html>

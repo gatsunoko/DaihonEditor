@@ -2,6 +2,8 @@
   "use strict";
 
   const STORAGE_KEY = "script-editor-project-v1";
+  const UI_STORAGE_KEY = "script-editor-ui-v1";
+  const SPEAKER_DRAG_TYPE = "application/x-script-speaker-name";
   const TYPE_LABELS = {
     dialogue: "会話",
     direction: "ト書き",
@@ -45,14 +47,24 @@
   let hasPendingSave = false;
   let saveTimer = 0;
   let renderTimer = 0;
+  let compactSidebarQuery = null;
+  let narrowSidebarQuery = null;
+  let speakerDrawerOpen = false;
+  let settingsDrawerOpen = false;
+  let uiState = {
+    speakerPaneVisible: true,
+    settingsPaneVisible: true,
+  };
 
   document.addEventListener("DOMContentLoaded", init);
 
   function init() {
     cacheElements();
     project = loadProject();
+    uiState = loadUiState();
     activeSectionId = project.activeSectionId || project.sections[0].id;
     bindEvents();
+    applySidebarVisibility();
     normalizeProject();
     renderAll();
     updateBodyColorButton();
@@ -65,6 +77,7 @@
     els.sectionTabs = document.getElementById("sectionTabs");
     els.addSectionButton = document.getElementById("addSectionButton");
     els.scriptRows = document.getElementById("scriptRows");
+    els.settingsPane = document.querySelector(".settings-pane");
     els.addLineButton = document.getElementById("addLineButton");
     els.bodyBoldButton = document.getElementById("bodyBoldButton");
     els.bodyColorApplyButton = document.getElementById("bodyColorApplyButton");
@@ -74,6 +87,8 @@
     els.copyLinesButton = document.getElementById("copyLinesButton");
     els.cutLinesButton = document.getElementById("cutLinesButton");
     els.pasteLinesButton = document.getElementById("pasteLinesButton");
+    els.toggleSpeakerPaneButton = document.getElementById("toggleSpeakerPaneButton");
+    els.toggleSettingsPaneButton = document.getElementById("toggleSettingsPaneButton");
     els.newProjectButton = document.getElementById("newProjectButton");
     els.saveJsonButton = document.getElementById("saveJsonButton");
     els.loadJsonInput = document.getElementById("loadJsonInput");
@@ -100,13 +115,43 @@
   }
 
   function bindEvents() {
+    compactSidebarQuery = window.matchMedia("(max-width: 1440px)");
+    narrowSidebarQuery = window.matchMedia("(max-width: 900px)");
+    compactSidebarQuery.addEventListener("change", handleCompactSidebarChange);
+    narrowSidebarQuery.addEventListener("change", handleCompactSidebarChange);
     document.addEventListener("click", (event) => {
+      if (
+        speakerDrawerOpen &&
+        isNarrowSpeakerDrawerMode() &&
+        !document.querySelector(".speaker-pane").contains(event.target) &&
+        !els.toggleSpeakerPaneButton.contains(event.target)
+      ) {
+        speakerDrawerOpen = false;
+        applySidebarVisibility();
+      }
+      if (
+        settingsDrawerOpen &&
+        isCompactSidebarMode() &&
+        !els.settingsPane.contains(event.target) &&
+        !els.toggleSettingsPaneButton.contains(event.target)
+      ) {
+        settingsDrawerOpen = false;
+        applySidebarVisibility();
+      }
       if (!speakerPicker) return;
       if (speakerPicker.element.contains(event.target) || speakerPicker.input === event.target) return;
       hideSpeakerPicker();
     });
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") hideSpeakerPicker();
+      if (event.key === "Escape" && speakerDrawerOpen && isNarrowSpeakerDrawerMode()) {
+        speakerDrawerOpen = false;
+        applySidebarVisibility();
+      }
+      if (event.key === "Escape" && settingsDrawerOpen && isCompactSidebarMode()) {
+        settingsDrawerOpen = false;
+        applySidebarVisibility();
+      }
     });
     document.addEventListener("selectionchange", updateBodySelectionFromDocument);
     window.addEventListener("resize", hideSpeakerPicker);
@@ -130,6 +175,29 @@
     els.copyLinesButton.addEventListener("click", copySelectedLines);
     els.cutLinesButton.addEventListener("click", cutSelectedLines);
     els.pasteLinesButton.addEventListener("click", pasteCopiedLines);
+    els.toggleSpeakerPaneButton.addEventListener("click", () => {
+      if (isNarrowSpeakerDrawerMode()) {
+        speakerDrawerOpen = !speakerDrawerOpen;
+        hideSpeakerPicker();
+        applySidebarVisibility();
+        return;
+      }
+      setSidebarVisibility("speaker", !uiState.speakerPaneVisible);
+    });
+    els.toggleSettingsPaneButton.addEventListener("click", () => {
+      if (isCompactSidebarMode()) {
+        settingsDrawerOpen = !settingsDrawerOpen;
+        hideSpeakerPicker();
+        applySidebarVisibility();
+        return;
+      }
+      setSidebarVisibility("settings", !uiState.settingsPaneVisible);
+    });
+    els.speakerList.addEventListener("dragover", handleSpeakerListDragOver);
+    els.speakerList.addEventListener("drop", handleSpeakerListDrop);
+    els.speakerList.addEventListener("dragleave", (event) => {
+      if (event.target === els.speakerList) clearAllSpeakerDropClasses();
+    });
     window.scriptEditorApplyBodyBold = applyBodyBoldFromPointer;
     els.bodyColorApplyButton.addEventListener("mousedown", applyBodyColorFromPointer);
     els.bodyColorClearButton.addEventListener("mousedown", preserveBodySelectionForToolbar);
@@ -223,6 +291,68 @@
       console.warn(error);
       return createDefaultProject();
     }
+  }
+
+  function loadUiState() {
+    try {
+      const raw = localStorage.getItem(UI_STORAGE_KEY);
+      if (!raw) return { speakerPaneVisible: true, settingsPaneVisible: true };
+      const parsed = JSON.parse(raw);
+      return {
+        speakerPaneVisible: parsed.speakerPaneVisible !== false,
+        settingsPaneVisible: parsed.settingsPaneVisible !== false,
+      };
+    } catch (error) {
+      console.warn(error);
+      return { speakerPaneVisible: true, settingsPaneVisible: true };
+    }
+  }
+
+  function saveUiState() {
+    localStorage.setItem(UI_STORAGE_KEY, JSON.stringify(uiState));
+  }
+
+  function setSidebarVisibility(side, visible) {
+    if (side === "speaker") uiState.speakerPaneVisible = Boolean(visible);
+    if (side === "settings") uiState.settingsPaneVisible = Boolean(visible);
+    hideSpeakerPicker();
+    applySidebarVisibility();
+    saveUiState();
+  }
+
+  function isCompactSidebarMode() {
+    return compactSidebarQuery ? compactSidebarQuery.matches : window.innerWidth <= 1440;
+  }
+
+  function isNarrowSpeakerDrawerMode() {
+    return narrowSidebarQuery ? narrowSidebarQuery.matches : window.innerWidth <= 900;
+  }
+
+  function handleCompactSidebarChange() {
+    settingsDrawerOpen = false;
+    speakerDrawerOpen = false;
+    applySidebarVisibility();
+  }
+
+  function applySidebarVisibility() {
+    const compactMode = isCompactSidebarMode();
+    const speakerDrawerMode = isNarrowSpeakerDrawerMode();
+    document.body.classList.toggle("sidebar-left-hidden", !speakerDrawerMode && !uiState.speakerPaneVisible);
+    document.body.classList.toggle("sidebar-right-hidden", !compactMode && !uiState.settingsPaneVisible);
+    document.body.classList.toggle("responsive-speaker-drawer", speakerDrawerMode);
+    document.body.classList.toggle("speaker-drawer-open", speakerDrawerMode && speakerDrawerOpen);
+    document.body.classList.toggle("responsive-settings-drawer", compactMode);
+    document.body.classList.toggle("settings-drawer-open", compactMode && settingsDrawerOpen);
+    updateSidebarToggleButton(els.toggleSpeakerPaneButton, speakerDrawerMode ? speakerDrawerOpen : uiState.speakerPaneVisible, "話者");
+    updateSidebarToggleButton(els.toggleSettingsPaneButton, compactMode ? settingsDrawerOpen : uiState.settingsPaneVisible, "設定");
+  }
+
+  function updateSidebarToggleButton(button, visible, label) {
+    if (!button) return;
+    button.setAttribute("aria-pressed", String(visible));
+    const action = visible ? "隠す" : "表示";
+    button.title = `${label}サイドバーを${action}`;
+    button.setAttribute("aria-label", `${label}サイドバーを${action}`);
   }
 
   function hydrateProject(raw) {
@@ -922,6 +1052,13 @@
       return;
     }
 
+    const topDropZone = document.createElement("div");
+    topDropZone.className = "speaker-drop-zone-top";
+    topDropZone.addEventListener("dragover", handleSpeakerTopDragOver);
+    topDropZone.addEventListener("drop", handleSpeakerTopDrop);
+    topDropZone.addEventListener("dragleave", () => topDropZone.classList.remove("drop-active"));
+    els.speakerList.appendChild(topDropZone);
+
     names.forEach((name) => {
       const speaker = project.speakers[name];
       const item = document.createElement("div");
@@ -940,10 +1077,13 @@
       handle.textContent = "⋮⋮";
       handle.addEventListener("dragstart", (event) => {
         event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData(SPEAKER_DRAG_TYPE, name);
         event.dataTransfer.setData("text/plain", name);
+        els.speakerList.classList.add("speaker-dragging-active");
         item.classList.add("dragging");
       });
       handle.addEventListener("dragend", () => {
+        els.speakerList.classList.remove("speaker-dragging-active");
         item.classList.remove("dragging");
         clearAllSpeakerDropClasses();
       });
@@ -1215,21 +1355,105 @@
   }
 
   function handleSpeakerDragOver(event, item) {
+    if (!hasSpeakerDragData(event)) return;
+    event.stopPropagation();
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
-    const rect = item.getBoundingClientRect();
-    const after = event.clientY > rect.top + rect.height / 2;
+    const after = isAfterSpeakerDropPoint(event, item);
     item.classList.toggle("drop-before", !after);
     item.classList.toggle("drop-after", after);
   }
 
   function handleSpeakerDrop(event, targetName, item) {
+    if (!hasSpeakerDragData(event)) return;
+    event.stopPropagation();
     event.preventDefault();
-    const draggedName = event.dataTransfer.getData("text/plain");
-    const rect = item.getBoundingClientRect();
-    const after = event.clientY > rect.top + rect.height / 2;
+    const draggedName = getDraggedSpeakerName(event);
+    const after = isAfterSpeakerDropPoint(event, item);
+    els.speakerList.classList.remove("speaker-dragging-active");
     clearAllSpeakerDropClasses();
     moveSpeaker(draggedName, targetName, after);
+  }
+
+  function handleSpeakerListDragOver(event) {
+    if (!hasSpeakerDragData(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const placement = getSpeakerListDropPlacement(event.clientY);
+    clearAllSpeakerDropClasses();
+    if (!placement) return;
+    placement.item.classList.toggle("drop-before", !placement.after);
+    placement.item.classList.toggle("drop-after", placement.after);
+  }
+
+  function handleSpeakerListDrop(event) {
+    if (!hasSpeakerDragData(event)) return;
+    event.preventDefault();
+    const placement = getSpeakerListDropPlacement(event.clientY);
+    const draggedName = getDraggedSpeakerName(event);
+    els.speakerList.classList.remove("speaker-dragging-active");
+    clearAllSpeakerDropClasses();
+    if (!placement) return;
+    moveSpeaker(draggedName, placement.targetName, placement.after);
+  }
+
+  function handleSpeakerTopDragOver(event) {
+    if (!hasSpeakerDragData(event)) return;
+    event.stopPropagation();
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    clearAllSpeakerDropClasses();
+    event.currentTarget.classList.add("drop-active");
+  }
+
+  function handleSpeakerTopDrop(event) {
+    if (!hasSpeakerDragData(event)) return;
+    event.stopPropagation();
+    event.preventDefault();
+    const draggedName = getDraggedSpeakerName(event);
+    els.speakerList.classList.remove("speaker-dragging-active");
+    clearAllSpeakerDropClasses();
+    moveSpeakerToIndex(draggedName, 0);
+  }
+
+  function hasSpeakerDragData(event) {
+    const types = Array.from(event.dataTransfer?.types || []);
+    return types.includes(SPEAKER_DRAG_TYPE) || types.includes("text/plain");
+  }
+
+  function getDraggedSpeakerName(event) {
+    return event.dataTransfer.getData(SPEAKER_DRAG_TYPE) || event.dataTransfer.getData("text/plain");
+  }
+
+  function isAfterSpeakerDropPoint(event, item) {
+    const rect = item.getBoundingClientRect();
+    const firstItem = els.speakerList.querySelector(".speaker-item");
+    const beforeLimit = item === firstItem ? rect.top + rect.height * 0.72 : rect.top + rect.height / 2;
+    return event.clientY > beforeLimit;
+  }
+
+  function getSpeakerListDropPlacement(clientY) {
+    const items = Array.from(els.speakerList.querySelectorAll(".speaker-item"));
+    if (!items.length) return null;
+
+    for (const item of items) {
+      const rect = item.getBoundingClientRect();
+      const beforeLimit = item === items[0] ? rect.top + rect.height * 0.72 : rect.top + rect.height / 2;
+      if (clientY <= beforeLimit) {
+        return {
+          item,
+          targetName: item.dataset.speakerName,
+          after: false,
+        };
+      }
+    }
+
+    const lastItem = items[items.length - 1];
+    return {
+      item: lastItem,
+      targetName: lastItem.dataset.speakerName,
+      after: true,
+    };
   }
 
   function clearSpeakerDropClasses(item) {
@@ -1238,6 +1462,9 @@
 
   function clearAllSpeakerDropClasses() {
     els.speakerList.querySelectorAll(".speaker-item").forEach(clearSpeakerDropClasses);
+    els.speakerList.querySelectorAll(".speaker-drop-zone-top").forEach((zone) => {
+      zone.classList.remove("drop-active");
+    });
   }
 
   function moveSpeaker(draggedName, targetName, after) {
@@ -1247,6 +1474,18 @@
     const targetIndex = withoutDragged.indexOf(targetName);
     if (targetIndex < 0) return;
     withoutDragged.splice(targetIndex + (after ? 1 : 0), 0, draggedName);
+    project.speakerOrder = withoutDragged;
+    renderSpeakers();
+    scheduleSave();
+  }
+
+  function moveSpeakerToIndex(draggedName, index) {
+    if (!draggedName) return;
+    syncSpeakerOrder();
+    if (!project.speakerOrder.includes(draggedName)) return;
+    const withoutDragged = project.speakerOrder.filter((name) => name !== draggedName);
+    const insertionIndex = clampNumber(index, 0, withoutDragged.length);
+    withoutDragged.splice(insertionIndex, 0, draggedName);
     project.speakerOrder = withoutDragged;
     renderSpeakers();
     scheduleSave();
