@@ -166,7 +166,7 @@
 
     els.projectTitle.addEventListener("focus", flushPendingSave);
     els.projectTitle.addEventListener("input", () => {
-      project.title = els.projectTitle.value.trim() || "無題の台本";
+      project.title = cleanProjectTitle(els.projectTitle.value);
       markSavePending();
     });
     els.projectTitle.addEventListener("blur", flushPendingSave);
@@ -268,7 +268,7 @@
   function createDefaultProject() {
     const sectionId = makeId("section");
     return {
-      title: "台本制作エディタ",
+      title: "無題の台本",
       activeSectionId: sectionId,
       sections: [
         {
@@ -1929,6 +1929,7 @@
   }
 
   function saveJson() {
+    syncProjectTitleFromInput();
     normalizeProject();
     const data = JSON.stringify(project, null, 2);
     downloadBlob(data, `${safeFileName(project.title)}.json`, "application/json");
@@ -1959,6 +1960,7 @@
   }
 
   function exportTxt() {
+    syncProjectTitleFromInput();
     downloadBlob(buildPlainTextExport(), `${safeFileName(project.title)}.txt`, "text/plain");
   }
 
@@ -2088,6 +2090,7 @@
   }
 
   function exportDocx() {
+    syncProjectTitleFromInput();
     normalizeProject();
     const docx = buildGoogleDocsDocx();
     downloadBytes(
@@ -2542,9 +2545,20 @@
   }
 
   function safeFileName(name) {
-    return String(name || "script")
+    const cleaned = String(name || "")
+      .trim()
       .replace(/[\\/:*?"<>|]/g, "_")
       .slice(0, 80);
+    return cleaned || "無題の台本";
+  }
+
+  function cleanProjectTitle(title) {
+    return String(title || "").trim();
+  }
+
+  function syncProjectTitleFromInput() {
+    project.title = cleanProjectTitle(els.projectTitle.value) || "無題の台本";
+    els.projectTitle.value = project.title;
   }
 
   function escapeXml(text) {
