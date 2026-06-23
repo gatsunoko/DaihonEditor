@@ -39,6 +39,7 @@
   let currentMatchIndex = -1;
   let speakerPicker = null;
   let selectedLineIds = new Set();
+  let lineSelectionAnchorId = "";
   let lineClipboard = [];
   let focusedLineId = "";
   let bodySelection = null;
@@ -84,6 +85,8 @@
     els.bodyColorInput = document.getElementById("bodyColorInput");
     els.bodyColorClearButton = document.getElementById("bodyColorClearButton");
     els.formatStatus = document.getElementById("formatStatus");
+    els.selectedLineStatus = document.getElementById("selectedLineStatus");
+    els.clearSelectedLinesButton = document.getElementById("clearSelectedLinesButton");
     els.copyLinesButton = document.getElementById("copyLinesButton");
     els.cutLinesButton = document.getElementById("cutLinesButton");
     els.pasteLinesButton = document.getElementById("pasteLinesButton");
@@ -172,6 +175,7 @@
     els.addLineButton.addEventListener("click", () => {
       addLineAfter(getActiveSection().lines.length - 1);
     });
+    els.clearSelectedLinesButton.addEventListener("click", clearLineSelection);
     els.copyLinesButton.addEventListener("click", copySelectedLines);
     els.cutLinesButton.addEventListener("click", cutSelectedLines);
     els.pasteLinesButton.addEventListener("click", pasteCopiedLines);
@@ -219,6 +223,7 @@
       project = createDefaultProject();
       activeSectionId = project.sections[0].id;
       selectedLineIds.clear();
+      lineSelectionAnchorId = "";
       focusedLineId = "";
       renderAll();
       scheduleSave();
@@ -449,6 +454,7 @@
         activeSectionId = section.id;
         project.activeSectionId = section.id;
         selectedLineIds.clear();
+        lineSelectionAnchorId = "";
         focusedLineId = "";
         renderAll();
         scheduleSave();
@@ -484,7 +490,10 @@
       number.textContent = String(index + 1).padStart(3, "0");
       number.draggable = true;
       number.title = "クリックで選択 / ドラッグで行移動";
-      number.addEventListener("click", () => toggleLineSelection(line.id));
+      number.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleLineSelection(line.id, event.shiftKey);
+      });
       number.addEventListener("dragstart", (event) => {
         const dragIds = selectedLineIds.has(line.id) ? Array.from(selectedLineIds) : [line.id];
         event.dataTransfer.effectAllowed = "move";
@@ -609,6 +618,7 @@
         if (document.activeElement !== bodyInput) bodyInput.innerHTML = bodyEditorHtml(line);
       }
     });
+    updateSelectedLineStatus();
   }
 
   function resizeBodyInput(input) {
@@ -1149,14 +1159,49 @@
     return lines.reduce((sum, line) => sum + Array.from(line.body || "").length, 0);
   }
 
-  function toggleLineSelection(lineId) {
+  function toggleLineSelection(lineId, extendRange = false) {
+    if (extendRange && selectLineRange(lineId)) {
+      renderRows();
+      return;
+    }
+
     if (selectedLineIds.has(lineId)) {
       selectedLineIds.delete(lineId);
     } else {
       selectedLineIds.add(lineId);
       focusedLineId = lineId;
     }
+    lineSelectionAnchorId = lineId;
     renderRows();
+  }
+
+  function selectLineRange(targetLineId) {
+    const lines = getActiveSection().lines;
+    const anchorId = lineSelectionAnchorId || focusedLineId || selectedLinesInOrder()[0]?.id || targetLineId;
+    const anchorIndex = lines.findIndex((line) => line.id === anchorId);
+    const targetIndex = lines.findIndex((line) => line.id === targetLineId);
+    if (anchorIndex < 0 || targetIndex < 0) return false;
+
+    const start = Math.min(anchorIndex, targetIndex);
+    const end = Math.max(anchorIndex, targetIndex);
+    selectedLineIds = new Set(lines.slice(start, end + 1).map((line) => line.id));
+    focusedLineId = targetLineId;
+    lineSelectionAnchorId = anchorId;
+    return true;
+  }
+
+  function clearLineSelection() {
+    selectedLineIds.clear();
+    lineSelectionAnchorId = "";
+    focusedLineId = "";
+    renderRows();
+  }
+
+  function updateSelectedLineStatus() {
+    if (!els.selectedLineStatus) return;
+    const count = selectedLineIds.size;
+    els.selectedLineStatus.textContent = count ? `${count}件の行を選択中` : "";
+    if (els.clearSelectedLinesButton) els.clearSelectedLinesButton.hidden = count === 0;
   }
 
   function handleLineDragOver(event, row) {
@@ -1223,6 +1268,7 @@
     section.lines = section.lines.filter((line) => !cutSet.has(line.id));
     if (!section.lines.length) section.lines.push(createLine());
     selectedLineIds.clear();
+    lineSelectionAnchorId = "";
     focusedLineId = "";
     normalizeProject();
     renderAll();
@@ -1236,6 +1282,7 @@
     if (section.lines.length === 1 && isBlankLine(section.lines[0]) && !focusedLineId && !selectedLineIds.size) {
       section.lines.splice(0, 1, ...pasted);
       selectedLineIds = new Set(pasted.map((line) => line.id));
+      lineSelectionAnchorId = pasted[0]?.id || "";
       focusedLineId = pasted[pasted.length - 1].id;
       normalizeProject();
       renderAll();
@@ -1257,6 +1304,7 @@
 
     section.lines.splice(insertIndex + 1, 0, ...pasted);
     selectedLineIds = new Set(pasted.map((line) => line.id));
+    lineSelectionAnchorId = pasted[0]?.id || "";
     focusedLineId = pasted[pasted.length - 1].id;
     normalizeProject();
     renderAll();
@@ -1561,6 +1609,7 @@
       section.lines.splice(index, 1);
     }
     if (removedLine) selectedLineIds.delete(removedLine.id);
+    if (lineSelectionAnchorId === removedLine?.id) lineSelectionAnchorId = "";
     if (focusedLineId === removedLine?.id) focusedLineId = "";
     renderAll();
     scheduleSave();
@@ -1894,6 +1943,7 @@
         project = hydrateProject(JSON.parse(String(reader.result)));
         activeSectionId = project.activeSectionId || project.sections[0].id;
         selectedLineIds.clear();
+        lineSelectionAnchorId = "";
         focusedLineId = "";
         normalizeProject();
         renderAll();

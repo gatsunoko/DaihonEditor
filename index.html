@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css?v=20260623-left-drawer-fit1">
+    <link rel="stylesheet" href="styles.css?v=20260623-range-select1">
   </head>
   <body>
     <div class="app-shell">
@@ -71,6 +71,8 @@
               <span id="formatStatus" class="format-status" aria-live="polite"></span>
             </div>
             <button id="addLineButton" type="button">行を追加</button>
+            <span id="selectedLineStatus" class="selected-line-status" aria-live="polite"></span>
+            <button id="clearSelectedLinesButton" class="selected-lines-clear" type="button" hidden>選択を解除</button>
             <button id="copyLinesButton" type="button">選択行をコピー</button>
             <button id="cutLinesButton" type="button">選択行をカット</button>
             <button id="pasteLinesButton" type="button">貼り付け</button>
@@ -144,6 +146,6 @@
       </main>
     </div>
 
-    <script src="app.js?v=20260623-left-drawer-fit1"></script>
+    <script src="app.js?v=20260623-range-select1"></script>
   </body>
 </html>

@@ -688,6 +688,37 @@ body.responsive-settings-drawer.settings-drawer-open .settings-pane {
   display: none;
 }
 
+.selected-line-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  background: #eff6ff;
+  color: #174ea6;
+  font-size: 13px;
+  font-weight: 800;
+  padding: 5px 10px;
+}
+
+.selected-line-status:empty {
+  display: none;
+}
+
+.selected-lines-clear {
+  min-height: 34px;
+  border-color: #bfdbfe;
+  background: #fff;
+  color: #174ea6;
+  font-size: 13px;
+  font-weight: 800;
+  padding: 5px 10px;
+}
+
+.selected-lines-clear[hidden] {
+  display: none;
+}
+
 .side-pane {
   display: flex;
   flex-direction: column;
@@ -1212,6 +1243,18 @@ body.responsive-settings-drawer.settings-drawer-open .settings-pane {
 
   .format-status {
     display: none;
+  }
+
+  .selected-line-status {
+    min-height: 32px;
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+
+  .selected-lines-clear {
+    min-height: 32px;
+    padding: 5px 8px;
+    font-size: 12px;
   }
 }
 
