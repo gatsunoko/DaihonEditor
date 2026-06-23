@@ -41,6 +41,7 @@
   let focusedLineId = "";
   let bodySelection = null;
   let bodySelectionRange = null;
+  let suppressBodyFocusScroll = false;
   let hasPendingSave = false;
   let saveTimer = 0;
   let renderTimer = 0;
@@ -54,6 +55,7 @@
     bindEvents();
     normalizeProject();
     renderAll();
+    updateBodyColorButton();
     setSaveState("LocalStorageに自動保存済み");
   }
 
@@ -64,8 +66,8 @@
     els.addSectionButton = document.getElementById("addSectionButton");
     els.scriptRows = document.getElementById("scriptRows");
     els.addLineButton = document.getElementById("addLineButton");
-    els.normalizeSpeakersButton = document.getElementById("normalizeSpeakersButton");
     els.bodyBoldButton = document.getElementById("bodyBoldButton");
+    els.bodyColorApplyButton = document.getElementById("bodyColorApplyButton");
     els.bodyColorInput = document.getElementById("bodyColorInput");
     els.bodyColorClearButton = document.getElementById("bodyColorClearButton");
     els.formatStatus = document.getElementById("formatStatus");
@@ -125,20 +127,20 @@
     els.addLineButton.addEventListener("click", () => {
       addLineAfter(getActiveSection().lines.length - 1);
     });
-    els.normalizeSpeakersButton.addEventListener("click", () => {
-      normalizeProject();
-      renderAll();
-      scheduleSave();
-    });
     els.copyLinesButton.addEventListener("click", copySelectedLines);
     els.cutLinesButton.addEventListener("click", cutSelectedLines);
     els.pasteLinesButton.addEventListener("click", pasteCopiedLines);
     window.scriptEditorApplyBodyBold = applyBodyBoldFromPointer;
-    els.bodyColorInput.addEventListener("mousedown", preserveBodySelectionForToolbar);
+    els.bodyColorApplyButton.addEventListener("mousedown", applyBodyColorFromPointer);
     els.bodyColorClearButton.addEventListener("mousedown", preserveBodySelectionForToolbar);
     els.bodyBoldButton.addEventListener("mousedown", applyBodyBoldFromPointer);
     els.bodyBoldButton.addEventListener("click", (event) => event.preventDefault());
-    els.bodyColorInput.addEventListener("input", () => applyBodyMark({ color: els.bodyColorInput.value }));
+    els.bodyColorApplyButton.addEventListener("click", (event) => event.preventDefault());
+    els.bodyColorInput.addEventListener("mousedown", preserveBodySelectionForToolbar);
+    els.bodyColorInput.addEventListener("input", () => {
+      updateBodyColorButton();
+      applyBodyMark({ color: els.bodyColorInput.value });
+    });
     els.bodyColorInput.addEventListener("change", flushPendingSave);
     els.bodyColorClearButton.addEventListener("click", () => {
       applyBodyMark({ color: "" });
@@ -438,7 +440,7 @@
         focusedLineId = line.id;
         captureBodySelection(line.id, bodyInput);
         resizeBodyInput(bodyInput);
-        centerRowForEditing(row);
+        if (!suppressBodyFocusScroll) centerRowForEditing(row);
       });
       bodyInput.addEventListener("beforeinput", () => captureBodySelection(line.id, bodyInput));
       bodyInput.addEventListener("blur", flushPendingSave);
@@ -647,6 +649,18 @@
     flushPendingSave();
   }
 
+  function applyBodyColorFromPointer(event) {
+    event.preventDefault();
+    updateBodySelectionFromDocument();
+    const applied = applyBodyMark({ color: els.bodyColorInput.value });
+    if (!applied) {
+      setFormatStatus("本文を選択してください");
+      return;
+    }
+    setFormatStatus("色を適用しました");
+    flushPendingSave();
+  }
+
   function captureActiveBodySelection() {
     const selection = document.getSelection?.();
     const selectionEditor = selection?.rangeCount
@@ -771,13 +785,23 @@
   }
 
   function restoreBodySelectionAfterRender(selection) {
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    const rowsScrollTop = els.scriptRows.scrollTop;
     const restore = () => {
       const row = Array.from(els.scriptRows.querySelectorAll(".script-row")).find((item) => item.dataset.lineId === selection.lineId);
       const editor = row?.querySelector(".body-input");
       if (!editor) return false;
-      editor.focus({ preventScroll: true });
-      setEditorSelection(editor, selection.start, selection.end);
-      captureBodySelection(selection.lineId, editor);
+      try {
+        suppressBodyFocusScroll = true;
+        editor.focus({ preventScroll: true });
+        setEditorSelection(editor, selection.start, selection.end);
+        captureBodySelection(selection.lineId, editor);
+      } finally {
+        suppressBodyFocusScroll = false;
+      }
+      els.scriptRows.scrollTop = rowsScrollTop;
+      window.scrollTo(scrollX, scrollY);
       return true;
     };
     if (restore()) {
@@ -828,6 +852,11 @@
   function setFormatStatus(text) {
     if (!els.formatStatus) return;
     els.formatStatus.textContent = text;
+  }
+
+  function updateBodyColorButton() {
+    if (!els.bodyColorApplyButton || !els.bodyColorInput) return;
+    els.bodyColorApplyButton.style.setProperty("--active-body-color", els.bodyColorInput.value);
   }
 
   function applyMarkToRange(marks, textLength, start, end, style) {

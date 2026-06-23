@@ -390,6 +390,12 @@ button:hover,
   background: #fbfdff;
 }
 
+.body-input::selection,
+.body-input *::selection {
+  background: rgba(245, 184, 65, 0.36);
+  color: inherit;
+}
+
 .body-input span[style*="font-weight"] {
   font-weight: 900 !important;
   text-shadow: 0.02em 0 0 currentColor;
@@ -465,22 +471,37 @@ button:hover,
   font-weight: 900;
 }
 
-.format-color-control {
+#bodyColorApplyButton {
+  position: relative;
+  font-weight: 800;
+}
+
+#bodyColorApplyButton::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 5px;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--active-body-color, #dc2626);
+}
+
+.format-color-picker {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
   min-height: 34px;
+  width: 40px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
   background: #fff;
   color: var(--text);
   cursor: pointer;
-  font-size: 13px;
-  font-weight: 700;
-  padding: 5px 8px;
+  padding: 5px;
 }
 
-.format-color-control input[type="color"] {
+.format-color-picker input[type="color"] {
   width: 30px;
   height: 22px;
   border: 0;
@@ -498,13 +519,23 @@ button:hover,
 .side-pane {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   position: sticky;
   top: var(--sticky-sidebar-top);
   align-self: start;
-  max-height: calc(100vh - var(--sticky-sidebar-top) - 16px);
+  max-height: calc(100vh - var(--sticky-sidebar-top) - 8px);
   overflow: auto;
   padding-bottom: 2px;
+}
+
+.settings-pane {
+  position: fixed;
+  top: var(--sticky-sidebar-top);
+  right: 16px;
+  width: 330px;
+  max-height: calc(100vh - var(--sticky-sidebar-top) - 8px);
+  z-index: 8;
+  overscroll-behavior: contain;
 }
 
 .panel {
@@ -633,7 +664,8 @@ button:hover,
 
 .docs-paste-preview {
   margin-top: 10px;
-  max-height: 260px;
+  height: 96px;
+  max-height: 96px;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -644,6 +676,15 @@ button:hover,
   font-size: 13px;
   line-height: 1.65;
   outline: none;
+}
+
+.settings-pane .panel {
+  padding: 12px;
+}
+
+.settings-pane .docs-paste-preview {
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .docs-paste-preview:focus {
@@ -797,6 +838,11 @@ button:hover,
   .editor-footer {
     left: 332px;
     right: 312px;
+  }
+
+  .settings-pane {
+    width: 280px;
+    right: 16px;
   }
 
   .editor-head,
