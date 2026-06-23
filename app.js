@@ -113,6 +113,7 @@
     els.speakerList = document.getElementById("speakerList");
     els.exportBlankLineInput = document.getElementById("exportBlankLineInput");
     els.copyGoogleDocsButton = document.getElementById("copyGoogleDocsButton");
+    els.copySelectedGoogleDocsButton = document.getElementById("copySelectedGoogleDocsButton");
     els.googleDocsCopyStatus = document.getElementById("googleDocsCopyStatus");
     els.googleDocsPreview = document.getElementById("googleDocsPreview");
   }
@@ -238,6 +239,7 @@
       scheduleSave();
     });
     els.copyGoogleDocsButton.addEventListener("click", copyGoogleDocsRichText);
+    els.copySelectedGoogleDocsButton.addEventListener("click", copySelectedGoogleDocsRichText);
 
     els.searchInput.addEventListener("input", updateMatches);
     document.querySelectorAll(".scope-button").forEach((button) => {
@@ -1202,6 +1204,7 @@
     const count = selectedLineIds.size;
     els.selectedLineStatus.textContent = count ? `${count}件の行を選択中` : "";
     if (els.clearSelectedLinesButton) els.clearSelectedLinesButton.hidden = count === 0;
+    if (els.copySelectedGoogleDocsButton) els.copySelectedGoogleDocsButton.disabled = count === 0;
   }
 
   function handleLineDragOver(event, row) {
@@ -1976,8 +1979,24 @@
   }
 
   async function copyGoogleDocsRichText() {
-    const html = buildGoogleDocsPasteHtmlDocument();
-    const plainText = buildGoogleDocsPastePlainText();
+    await copyGoogleDocsRichTextPayload(
+      buildGoogleDocsPasteHtmlDocument(),
+      buildGoogleDocsPastePlainText(),
+      "リッチ形式でコピーしました。Googleドキュメントに貼り付けできます。"
+    );
+  }
+
+  async function copySelectedGoogleDocsRichText() {
+    const selected = selectedLinesInOrder();
+    if (!selected.length) return;
+    await copyGoogleDocsRichTextPayload(
+      buildGoogleDocsPasteHtmlDocument(selected),
+      buildGoogleDocsPastePlainText(selected),
+      `${selected.length}件の選択行をリッチコピーしました。`
+    );
+  }
+
+  async function copyGoogleDocsRichTextPayload(html, plainText, successMessage) {
     try {
       if (navigator.clipboard && window.ClipboardItem) {
         await navigator.clipboard.write([
@@ -1986,7 +2005,7 @@
             "text/plain": new Blob([plainText], { type: "text/plain" }),
           }),
         ]);
-        setGoogleDocsCopyStatus("リッチ形式でコピーしました。Googleドキュメントに貼り付けできます。");
+        setGoogleDocsCopyStatus(successMessage);
         return;
       }
       throw new Error("Rich clipboard is not available.");
@@ -2001,19 +2020,20 @@
     }
   }
 
-  function buildGoogleDocsPasteHtmlDocument() {
+  function buildGoogleDocsPasteHtmlDocument(lines = null) {
     return `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
   </head>
   <body>
-    ${buildGoogleDocsPasteHtmlBody()}
+    ${buildGoogleDocsPasteHtmlBody(lines)}
   </body>
 </html>`;
   }
 
-  function buildGoogleDocsPasteHtmlBody() {
+  function buildGoogleDocsPasteHtmlBody(lines = null) {
+    if (Array.isArray(lines)) return buildGoogleDocsLinesHtml(lines);
     const includeSectionTitles = project.sections.length > 1;
     const blocks = [];
     project.sections.forEach((section, sectionIndex) => {
@@ -2031,7 +2051,22 @@
     return blocks.length ? blocks.join("\n") : blankPasteParagraphHtml();
   }
 
-  function buildGoogleDocsPastePlainText() {
+  function buildGoogleDocsLinesHtml(lines) {
+    const blocks = [];
+    lines.forEach((line, lineIndex) => {
+      blocks.push(linePasteHtml(line));
+      if (project.settings.exportBlankLineBetweenLines && lineIndex < lines.length - 1) {
+        blocks.push(blankPasteParagraphHtml());
+      }
+    });
+    return blocks.length ? blocks.join("\n") : blankPasteParagraphHtml();
+  }
+
+  function buildGoogleDocsPastePlainText(lines = null) {
+    if (Array.isArray(lines)) {
+      const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
+      return lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body)).join(lineSeparator);
+    }
     const includeSectionTitles = project.sections.length > 1;
     const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
     const sectionTexts = project.sections.map((section) => {
@@ -2051,7 +2086,7 @@
     if (line.speaker) {
       const color = `#${normalizeDocxColor(project.speakers[line.speaker]?.color || autoColor(line.speaker))}`;
       parts.push(`<strong style="color:${color}; font-weight:700;">${escapeHtml(line.speaker)}</strong>`);
-      parts.push('<strong style="font-weight:700;">：</strong>');
+      parts.push('<span style="font-weight:400;">：</span>');
     }
     parts.push(bodyPasteHtml(line));
     return `<p style="${pasteParagraphStyle()}">${parts.join("") || "<br>"}</p>`;
@@ -2130,7 +2165,7 @@
             bold: true,
             color: normalizeDocxColor(project.speakers[line.speaker]?.color || autoColor(line.speaker)),
           });
-          runs.push({ text: "：", bold: true });
+          runs.push({ text: "：", bold: false });
         }
         if (line.body) {
           styledTextRuns(line.body, line.bodyMarks).forEach((run) => {

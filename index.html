@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css?v=20260624-title-input-ui1">
+    <link rel="stylesheet" href="styles.css?v=20260624-normal-colon1">
   </head>
   <body>
     <div class="app-shell">
@@ -131,7 +131,8 @@
           <section class="panel compact">
             <h2>Google Docs貼付け</h2>
             <div class="paste-copy-actions">
-              <button id="copyGoogleDocsButton" type="button">リッチコピー</button>
+              <button id="copyGoogleDocsButton" type="button">全文リッチコピー</button>
+              <button id="copySelectedGoogleDocsButton" type="button" disabled>選択行コピー</button>
             </div>
             <div id="googleDocsCopyStatus" class="status-line">下のプレビューを選択してコピーすることもできます。</div>
             <div
@@ -146,6 +147,6 @@
       </main>
     </div>
 
-    <script src="app.js?v=20260624-title-input-ui1"></script>
+    <script src="app.js?v=20260624-normal-colon1"></script>
   </body>
 </html>
