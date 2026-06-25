@@ -1769,12 +1769,6 @@
   }
 
   function pruneUnusedAutoSpeakers() {
-    const counts = speakerCounts();
-    Object.keys(project.speakers).forEach((name) => {
-      if (project.speakers[name].auto && !counts[name]) {
-        delete project.speakers[name];
-      }
-    });
     syncSpeakerOrder();
   }
 
@@ -2096,11 +2090,10 @@
     const runs = styledTextRuns(line.body, line.bodyMarks);
     if (!runs.length) return "";
     return runs.map((run) => {
-      const styles = [];
-      if (run.bold) styles.push("font-weight:700");
+      const styles = [`font-weight:${run.bold ? "700" : "400"}`];
       if (run.color) styles.push(`color:${run.color}`);
       const text = escapeHtml(run.text).replace(/\n/g, "<br>");
-      return styles.length ? `<span style="${styles.join(";")}">${text}</span>` : text;
+      return `<span style="${styles.join(";")}">${text}</span>`;
     }).join("");
   }
 
@@ -2109,7 +2102,7 @@
   }
 
   function pasteParagraphStyle() {
-    return 'margin:0; color:#111827; font-family:Arial, "Yu Gothic", "Yu Gothic UI", Meiryo, sans-serif; font-size:11pt; line-height:1.65; background:transparent;';
+    return 'margin:0; color:#111827; font-family:Arial, "Yu Gothic", "Yu Gothic UI", Meiryo, sans-serif; font-size:11pt; font-weight:400; line-height:1.65; background:transparent;';
   }
 
   function selectGoogleDocsPreview() {
