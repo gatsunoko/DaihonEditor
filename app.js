@@ -4,6 +4,7 @@
   const STORAGE_KEY = "script-editor-project-v1";
   const UI_STORAGE_KEY = "script-editor-ui-v1";
   const SPEAKER_DRAG_TYPE = "application/x-script-speaker-name";
+  const MAX_LINE_DELETE_UNDO = 30;
   const TYPE_LABELS = {
     dialogue: "会話",
     direction: "ト書き",
@@ -41,6 +42,7 @@
   let selectedLineIds = new Set();
   let lineSelectionAnchorId = "";
   let lineClipboard = [];
+  let lineDeleteUndoStack = [];
   let focusedLineId = "";
   let bodySelection = null;
   let bodySelectionRange = null;
@@ -80,6 +82,7 @@
     els.scriptRows = document.getElementById("scriptRows");
     els.settingsPane = document.querySelector(".settings-pane");
     els.addLineButton = document.getElementById("addLineButton");
+    els.undoDeleteLineButton = document.getElementById("undoDeleteLineButton");
     els.bodyBoldButton = document.getElementById("bodyBoldButton");
     els.bodyColorApplyButton = document.getElementById("bodyColorApplyButton");
     els.bodyColorInput = document.getElementById("bodyColorInput");
@@ -156,6 +159,10 @@
         settingsDrawerOpen = false;
         applySidebarVisibility();
       }
+      if (isUndoShortcut(event) && lineDeleteUndoStack.length && !isEditableTarget(event.target)) {
+        event.preventDefault();
+        undoDeletedLines();
+      }
     });
     document.addEventListener("selectionchange", updateBodySelectionFromDocument);
     window.addEventListener("resize", hideSpeakerPicker);
@@ -176,6 +183,7 @@
     els.addLineButton.addEventListener("click", () => {
       addLineAfter(getActiveSection().lines.length - 1);
     });
+    els.undoDeleteLineButton.addEventListener("click", undoDeletedLines);
     els.clearSelectedLinesButton.addEventListener("click", clearLineSelection);
     els.copyLinesButton.addEventListener("click", copySelectedLines);
     els.cutLinesButton.addEventListener("click", cutSelectedLines);
@@ -225,6 +233,7 @@
       activeSectionId = project.sections[0].id;
       selectedLineIds.clear();
       lineSelectionAnchorId = "";
+      lineDeleteUndoStack = [];
       focusedLineId = "";
       renderAll();
       scheduleSave();
@@ -446,23 +455,40 @@
 
   function renderTabs() {
     els.sectionTabs.innerHTML = "";
-    project.sections.forEach((section) => {
+    project.sections.forEach((section, index) => {
+      const isActive = section.id === activeSectionId;
+      const item = document.createElement("div");
+      item.className = `tab-item${isActive ? " active" : ""}`;
+
       const tab = document.createElement("button");
-      tab.className = `tab${section.id === activeSectionId ? " active" : ""}`;
+      tab.className = "tab";
       tab.type = "button";
       tab.setAttribute("role", "tab");
-      tab.innerHTML = `<span>${escapeHtml(section.title)}</span><span class="tab-dot"></span>`;
-      tab.addEventListener("click", () => {
-        activeSectionId = section.id;
-        project.activeSectionId = section.id;
-        selectedLineIds.clear();
-        lineSelectionAnchorId = "";
-        focusedLineId = "";
-        renderAll();
-        scheduleSave();
-      });
+      tab.setAttribute("aria-selected", String(isActive));
+
+      const title = document.createElement("span");
+      title.className = "tab-title";
+      title.textContent = section.title;
+      const dot = document.createElement("span");
+      dot.className = "tab-dot";
+      tab.append(title, dot);
+
+      tab.addEventListener("click", () => activateSection(section.id));
       tab.addEventListener("dblclick", () => renameSection(section.id));
-      els.sectionTabs.appendChild(tab);
+
+      const actions = document.createElement("div");
+      actions.className = "tab-actions";
+
+      const movePrevious = createSectionActionButton("前へ移動", "‹", () => moveSection(section.id, -1));
+      movePrevious.disabled = index === 0;
+      const moveNext = createSectionActionButton("後へ移動", "›", () => moveSection(section.id, 1));
+      moveNext.disabled = index === project.sections.length - 1;
+      const remove = createSectionActionButton("削除", "×", () => deleteSection(section.id), "delete");
+      remove.disabled = project.sections.length <= 1;
+
+      actions.append(movePrevious, moveNext, remove);
+      item.append(tab, actions);
+      els.sectionTabs.appendChild(item);
     });
   }
 
@@ -621,6 +647,7 @@
       }
     });
     updateSelectedLineStatus();
+    updateLineDeleteUndoButton();
   }
 
   function resizeBodyInput(input) {
@@ -828,6 +855,18 @@
   function closestBodyEditor(node) {
     const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     return element?.closest?.(".body-input") || null;
+  }
+
+  function isUndoShortcut(event) {
+    return (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "z";
+  }
+
+  function isEditableTarget(target) {
+    const element = target?.nodeType === Node.ELEMENT_NODE ? target : target?.parentElement;
+    if (!element) return false;
+    if (element.closest?.("[contenteditable='true']")) return true;
+    const tagName = element.tagName;
+    return tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT";
   }
 
   function selectionOffsetsForEditor(editor) {
@@ -1207,6 +1246,66 @@
     if (els.copySelectedGoogleDocsButton) els.copySelectedGoogleDocsButton.disabled = count === 0;
   }
 
+  function updateLineDeleteUndoButton() {
+    if (!els.undoDeleteLineButton) return;
+    els.undoDeleteLineButton.disabled = lineDeleteUndoStack.length === 0;
+    const latest = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
+    const count = latest?.lines?.length || 0;
+    els.undoDeleteLineButton.textContent = count > 1 ? `${count}行の削除を元に戻す` : "削除を元に戻す";
+  }
+
+  function pushLineDeleteUndo(entry) {
+    if (!entry?.lines?.length) return;
+    lineDeleteUndoStack.push(entry);
+    if (lineDeleteUndoStack.length > MAX_LINE_DELETE_UNDO) lineDeleteUndoStack.shift();
+    updateLineDeleteUndoButton();
+  }
+
+  function undoDeletedLines() {
+    const entry = lineDeleteUndoStack.pop();
+    if (!entry) {
+      updateLineDeleteUndoButton();
+      return;
+    }
+    const section = project.sections.find((item) => item.id === entry.sectionId);
+    if (!section) {
+      updateLineDeleteUndoButton();
+      return;
+    }
+    const items = (entry.items || entry.lines.map((line, index) => ({ index: entry.index + index, line })))
+      .slice()
+      .sort((a, b) => a.index - b.index);
+    const restored = [];
+    if (entry.mode === "replace-blank") {
+      const restoredLines = items.map((item) => cloneLineForUndo(item.line, section));
+      restored.push(...restoredLines);
+      const placeholderIndex = section.lines.findIndex((line) => line.id === entry.placeholderLineId);
+      if (placeholderIndex >= 0 && isBlankLine(section.lines[placeholderIndex])) {
+        section.lines.splice(placeholderIndex, 1, ...restoredLines);
+      } else {
+        section.lines.splice(Math.min(entry.index, section.lines.length), 0, ...restoredLines);
+      }
+    } else {
+      items.forEach((item) => {
+        const restoredLine = cloneLineForUndo(item.line, section);
+        section.lines.splice(Math.min(item.index, section.lines.length), 0, restoredLine);
+        restored.push(restoredLine);
+      });
+    }
+    activeSectionId = section.id;
+    project.activeSectionId = section.id;
+    selectedLineIds = new Set(restored.map((line) => line.id));
+    lineSelectionAnchorId = restored[0]?.id || "";
+    focusedLineId = restored[restored.length - 1]?.id || "";
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+    requestAnimationFrame(() => {
+      const restoredIndex = section.lines.findIndex((line) => line.id === focusedLineId);
+      if (restoredIndex >= 0) focusLine(restoredIndex, "speaker");
+    });
+  }
+
   function handleLineDragOver(event, row) {
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
@@ -1266,10 +1365,26 @@
     const section = getActiveSection();
     const selected = selectedLinesInOrder();
     if (!selected.length) return;
+    const firstIndex = section.lines.findIndex((line) => line.id === selected[0].id);
     lineClipboard = selected.map(cloneLineForClipboard);
+    const undoEntry = {
+      sectionId: section.id,
+      index: Math.max(0, firstIndex),
+      mode: selected.length === section.lines.length ? "replace-blank" : "insert",
+      lines: selected.map(cloneLineForDeleteUndo),
+      items: selected.map((line) => ({
+        index: section.lines.findIndex((item) => item.id === line.id),
+        line: cloneLineForDeleteUndo(line),
+      })),
+    };
     const cutSet = new Set(selected.map((line) => line.id));
     section.lines = section.lines.filter((line) => !cutSet.has(line.id));
-    if (!section.lines.length) section.lines.push(createLine());
+    if (!section.lines.length) {
+      const blankLine = createLine();
+      section.lines.push(blankLine);
+      undoEntry.placeholderLineId = blankLine.id;
+    }
+    pushLineDeleteUndo(undoEntry);
     selectedLineIds.clear();
     lineSelectionAnchorId = "";
     focusedLineId = "";
@@ -1325,10 +1440,25 @@
     };
   }
 
+  function cloneLineForDeleteUndo(line) {
+    return {
+      ...cloneLineForClipboard(line),
+      id: line.id,
+    };
+  }
+
   function cloneLineForPaste(line) {
     return {
       ...cloneLineForClipboard(line),
       id: makeId("line"),
+    };
+  }
+
+  function cloneLineForUndo(line, section) {
+    const existingIds = new Set(section.lines.map((item) => item.id));
+    return {
+      ...cloneLineForClipboard(line),
+      id: line.id && !existingIds.has(line.id) ? line.id : makeId("line"),
     };
   }
 
@@ -1568,6 +1698,66 @@
     return project.sections.find((section) => section.id === activeSectionId) || project.sections[0];
   }
 
+  function activateSection(sectionId) {
+    if (sectionId === activeSectionId) return;
+    activeSectionId = sectionId;
+    project.activeSectionId = sectionId;
+    clearLineSelectionState();
+    renderAll();
+    scheduleSave();
+  }
+
+  function clearLineSelectionState() {
+    selectedLineIds.clear();
+    lineSelectionAnchorId = "";
+    focusedLineId = "";
+  }
+
+  function createSectionActionButton(title, label, onClick, modifier = "") {
+    const button = document.createElement("button");
+    button.className = `tab-action${modifier ? ` ${modifier}` : ""}`;
+    button.type = "button";
+    button.title = title;
+    button.setAttribute("aria-label", title);
+    button.textContent = label;
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      onClick();
+    });
+    return button;
+  }
+
+  function moveSection(sectionId, direction) {
+    const index = project.sections.findIndex((section) => section.id === sectionId);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= project.sections.length) return;
+    const [section] = project.sections.splice(index, 1);
+    project.sections.splice(nextIndex, 0, section);
+    activeSectionId = section.id;
+    project.activeSectionId = section.id;
+    clearLineSelectionState();
+    renderAll();
+    scheduleSave();
+  }
+
+  function deleteSection(sectionId) {
+    if (project.sections.length <= 1) return;
+    const index = project.sections.findIndex((section) => section.id === sectionId);
+    if (index < 0) return;
+    const section = project.sections[index];
+    if (!confirm(`「${section.title}」を削除しますか？\nこのセクション内の行も削除されます。`)) return;
+    project.sections.splice(index, 1);
+    if (activeSectionId === sectionId) {
+      const nextSection = project.sections[Math.min(index, project.sections.length - 1)];
+      activeSectionId = nextSection.id;
+      project.activeSectionId = nextSection.id;
+    }
+    clearLineSelectionState();
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+  }
+
   function addSection() {
     const next = project.sections.length + 1;
     const title = `${String(next).padStart(2, "0")} 新規セクション`;
@@ -1606,12 +1796,23 @@
   function deleteLine(index) {
     const section = getActiveSection();
     const removedLine = section.lines[index];
+    if (!removedLine) return;
+    const undoEntry = {
+      sectionId: section.id,
+      index,
+      mode: section.lines.length === 1 ? "replace-blank" : "insert",
+      lines: [cloneLineForDeleteUndo(removedLine)],
+      items: [{ index, line: cloneLineForDeleteUndo(removedLine) }],
+    };
     if (section.lines.length === 1) {
-      section.lines[0] = createLine();
+      const blankLine = createLine();
+      section.lines[0] = blankLine;
+      undoEntry.placeholderLineId = blankLine.id;
     } else {
       section.lines.splice(index, 1);
     }
-    if (removedLine) selectedLineIds.delete(removedLine.id);
+    pushLineDeleteUndo(undoEntry);
+    selectedLineIds.delete(removedLine.id);
     if (lineSelectionAnchorId === removedLine?.id) lineSelectionAnchorId = "";
     if (focusedLineId === removedLine?.id) focusedLineId = "";
     renderAll();
@@ -1942,6 +2143,7 @@
         activeSectionId = project.activeSectionId || project.sections[0].id;
         selectedLineIds.clear();
         lineSelectionAnchorId = "";
+        lineDeleteUndoStack = [];
         focusedLineId = "";
         normalizeProject();
         renderAll();

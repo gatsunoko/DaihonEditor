@@ -325,31 +325,85 @@ body.responsive-settings-drawer.settings-drawer-open .settings-pane {
   overflow-x: auto;
 }
 
-.tab {
+.tab-item {
   display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border: 0;
-  border-right: 1px solid var(--line);
-  border-radius: 0;
-  background: transparent;
-  padding: 0 16px;
-  min-width: 150px;
+  align-items: stretch;
+  flex: 0 0 auto;
+  min-width: 214px;
+  max-width: 280px;
   height: 46px;
-  font-weight: 700;
+  border-right: 1px solid var(--line);
+  background: transparent;
 }
 
-.tab.active {
+.tab-item.active {
   background: #fff;
   color: #174ea6;
   box-shadow: inset 0 -3px 0 var(--accent);
 }
 
-.tab .tab-dot {
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0 8px 0 16px;
+  height: 46px;
+  font-weight: 700;
+}
+
+.tab-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-dot {
+  flex: 0 0 auto;
   width: 8px;
   height: 8px;
   border-radius: 99px;
   background: #4ade80;
+}
+
+.tab-actions {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding-right: 6px;
+}
+
+.tab-action {
+  width: 22px;
+  min-height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #64748b;
+  font-size: 17px;
+  line-height: 1;
+  padding: 0;
+}
+
+.tab-action:hover:not(:disabled) {
+  background: #eaf2ff;
+  color: #174ea6;
+}
+
+.tab-action.delete:hover:not(:disabled) {
+  background: #fff1f2;
+  color: var(--danger);
+}
+
+.tab-action:disabled {
+  cursor: default;
+  opacity: 0.28;
 }
 
 .icon-button {
@@ -1101,6 +1155,11 @@ body.responsive-settings-drawer.settings-drawer-open .settings-pane {
   .script-row {
     grid-template-columns: 46px minmax(124px, 188px) minmax(0, 1fr) 28px;
   }
+
+  .tab-item {
+    min-width: 190px;
+    max-width: 240px;
+  }
 }
 
 @media (max-width: 900px) {
@@ -1133,6 +1192,27 @@ body.responsive-settings-drawer.settings-drawer-open .settings-pane {
     min-width: 0;
     overflow-x: auto;
     padding-bottom: 2px;
+  }
+
+  .tab-item {
+    min-width: 166px;
+    max-width: 220px;
+  }
+
+  .tab {
+    padding-left: 12px;
+    padding-right: 5px;
+  }
+
+  .tab-actions {
+    gap: 0;
+    padding-right: 4px;
+  }
+
+  .tab-action {
+    width: 20px;
+    min-height: 24px;
+    font-size: 16px;
   }
 
   .workspace,
