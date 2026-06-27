@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css?v=20260627-line-undo1">
+    <link rel="stylesheet" href="styles.css?v=20260628-speaker-filter-replace1">
   </head>
   <body>
     <div class="app-shell">
@@ -43,6 +43,12 @@
               <input id="speakerBodyColorInput" type="color" value="#1f2937" aria-label="本文色" title="本文色">
               <button type="submit">登録</button>
             </form>
+            <label class="speaker-filter">
+              <span>表示する話者</span>
+              <select id="speakerFilterSelect">
+                <option value="">すべての話者</option>
+              </select>
+            </label>
             <div id="speakerList" class="speaker-list"></div>
           </section>
         </aside>
@@ -98,6 +104,10 @@
               <button class="scope-button" type="button" data-scope="speaker">話者名</button>
               <button class="scope-button" type="button" data-scope="body">本文</button>
             </div>
+            <label class="option-row search-section-only">
+              <input id="replaceCurrentSectionOnlyInput" type="checkbox">
+              <span>現在のセクションのみ</span>
+            </label>
             <div class="search-actions">
               <button id="prevMatchButton" type="button">前へ</button>
               <button id="nextMatchButton" type="button">次へ</button>
@@ -133,6 +143,7 @@
             <h2>Google Docs貼付け</h2>
             <div class="paste-copy-actions">
               <button id="copyGoogleDocsButton" type="button">全文リッチコピー</button>
+              <button id="copyFilteredGoogleDocsButton" type="button" disabled>表示話者コピー</button>
               <button id="copySelectedGoogleDocsButton" type="button" disabled>選択行コピー</button>
             </div>
             <div id="googleDocsCopyStatus" class="status-line">下のプレビューを選択してコピーすることもできます。</div>
@@ -148,6 +159,6 @@
       </main>
     </div>
 
-    <script src="app.js?v=20260627-line-undo1"></script>
+    <script src="app.js?v=20260628-speaker-filter-replace1"></script>
   </body>
 </html>

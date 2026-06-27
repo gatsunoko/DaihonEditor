@@ -36,6 +36,7 @@
   let project = createDefaultProject();
   let activeSectionId = project.sections[0].id;
   let selectedScope = "all";
+  let activeSpeakerFilter = "";
   let matches = [];
   let currentMatchIndex = -1;
   let speakerPicker = null;
@@ -106,6 +107,7 @@
     els.nextMatchButton = document.getElementById("nextMatchButton");
     els.replaceOneButton = document.getElementById("replaceOneButton");
     els.replaceAllButton = document.getElementById("replaceAllButton");
+    els.replaceCurrentSectionOnlyInput = document.getElementById("replaceCurrentSectionOnlyInput");
     els.matchStatus = document.getElementById("matchStatus");
     els.totalBodyChars = document.getElementById("totalBodyChars");
     els.sectionBodyChars = document.getElementById("sectionBodyChars");
@@ -113,9 +115,11 @@
     els.speakerNameInput = document.getElementById("speakerNameInput");
     els.speakerColorInput = document.getElementById("speakerColorInput");
     els.speakerBodyColorInput = document.getElementById("speakerBodyColorInput");
+    els.speakerFilterSelect = document.getElementById("speakerFilterSelect");
     els.speakerList = document.getElementById("speakerList");
     els.exportBlankLineInput = document.getElementById("exportBlankLineInput");
     els.copyGoogleDocsButton = document.getElementById("copyGoogleDocsButton");
+    els.copyFilteredGoogleDocsButton = document.getElementById("copyFilteredGoogleDocsButton");
     els.copySelectedGoogleDocsButton = document.getElementById("copySelectedGoogleDocsButton");
     els.googleDocsCopyStatus = document.getElementById("googleDocsCopyStatus");
     els.googleDocsPreview = document.getElementById("googleDocsPreview");
@@ -231,6 +235,7 @@
       if (!confirm("現在の内容を破棄して新規作成しますか？")) return;
       project = createDefaultProject();
       activeSectionId = project.sections[0].id;
+      activeSpeakerFilter = "";
       selectedLineIds.clear();
       lineSelectionAnchorId = "";
       lineDeleteUndoStack = [];
@@ -248,9 +253,11 @@
       scheduleSave();
     });
     els.copyGoogleDocsButton.addEventListener("click", copyGoogleDocsRichText);
+    els.copyFilteredGoogleDocsButton.addEventListener("click", copyFilteredSpeakerGoogleDocsRichText);
     els.copySelectedGoogleDocsButton.addEventListener("click", copySelectedGoogleDocsRichText);
 
     els.searchInput.addEventListener("input", updateMatches);
+    els.replaceCurrentSectionOnlyInput.addEventListener("change", updateMatches);
     document.querySelectorAll(".scope-button").forEach((button) => {
       button.addEventListener("click", () => {
         selectedScope = button.dataset.scope;
@@ -273,6 +280,15 @@
       els.speakerNameInput.value = "";
       renderAll();
       scheduleSave();
+    });
+    els.speakerFilterSelect.addEventListener("change", () => {
+      activeSpeakerFilter = els.speakerFilterSelect.value;
+      clearLineSelectionState();
+      hideSpeakerPicker();
+      renderRows();
+      renderStats();
+      updateFilteredGoogleDocsButton();
+      updateMatches();
     });
   }
 
@@ -442,6 +458,7 @@
     renderStats();
     renderExportSettings();
     renderGoogleDocsPreview();
+    updateFilteredGoogleDocsButton();
     updateMatches();
   }
 
@@ -495,8 +512,12 @@
   function renderRows() {
     hideSpeakerPicker();
     const section = getActiveSection();
+    const speakerFilter = getActiveSpeakerFilter();
+    let visibleCount = 0;
     els.scriptRows.innerHTML = "";
     section.lines.forEach((line, index) => {
+      if (!lineMatchesSpeakerFilter(line, speakerFilter)) return;
+      visibleCount += 1;
       const speaker = project.speakers[line.speaker];
       const color = speaker?.color || autoColor(line.speaker);
       const bodyColor = getSpeakerBodyColor(speaker);
@@ -646,13 +667,31 @@
         if (document.activeElement !== bodyInput) bodyInput.innerHTML = bodyEditorHtml(line);
       }
     });
+    if (speakerFilter && visibleCount === 0) {
+      const empty = document.createElement("div");
+      empty.className = "speaker-filter-empty";
+      empty.textContent = `このセクションに「${speakerFilter}」の行はありません。`;
+      els.scriptRows.appendChild(empty);
+    }
     updateSelectedLineStatus();
     updateLineDeleteUndoButton();
+    updateFilteredGoogleDocsButton();
   }
 
   function resizeBodyInput(input) {
     input.style.height = "auto";
     input.style.height = `${input.scrollHeight}px`;
+  }
+
+  function getActiveSpeakerFilter() {
+    if (activeSpeakerFilter && !project.speakers?.[activeSpeakerFilter]) {
+      activeSpeakerFilter = "";
+    }
+    return activeSpeakerFilter;
+  }
+
+  function lineMatchesSpeakerFilter(line, speakerFilter = getActiveSpeakerFilter()) {
+    return !speakerFilter || line.speaker === speakerFilter;
   }
 
   function centerRowForEditing(row) {
@@ -1094,6 +1133,7 @@
     const counts = speakerCounts();
     syncSpeakerOrder();
     const names = orderedSpeakerNames();
+    renderSpeakerFilterOptions(names);
     els.speakerList.innerHTML = "";
     if (!names.length) {
       const empty = document.createElement("div");
@@ -1170,6 +1210,7 @@
       bodyColorInput.addEventListener("input", () => {
         speaker.bodyColor = bodyColorInput.value;
         renderRows();
+        renderGoogleDocsPreview();
         markSavePending();
       });
       bodyColorInput.addEventListener("change", flushPendingSave);
@@ -1187,11 +1228,31 @@
     });
   }
 
+  function renderSpeakerFilterOptions(names) {
+    if (!els.speakerFilterSelect) return;
+    const speakerFilter = getActiveSpeakerFilter();
+    els.speakerFilterSelect.innerHTML = "";
+    const allOption = document.createElement("option");
+    allOption.value = "";
+    allOption.textContent = "すべての話者";
+    els.speakerFilterSelect.appendChild(allOption);
+    names.forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      els.speakerFilterSelect.appendChild(option);
+    });
+    els.speakerFilterSelect.value = speakerFilter;
+    els.speakerFilterSelect.disabled = names.length === 0;
+  }
+
   function renderStats() {
     const total = project.sections.reduce((sum, section) => {
       return sum + countBodyChars(section.lines);
     }, 0);
-    const active = countBodyChars(getActiveSection().lines);
+    const speakerFilter = getActiveSpeakerFilter();
+    const activeLines = getActiveSection().lines.filter((line) => lineMatchesSpeakerFilter(line, speakerFilter));
+    const active = countBodyChars(activeLines);
     els.totalBodyChars.textContent = total.toLocaleString("ja-JP");
     els.sectionBodyChars.textContent = active.toLocaleString("ja-JP");
   }
@@ -1866,6 +1927,10 @@
     }
     pruneUnusedAutoSpeakers();
     renderSpeakers();
+    if (getActiveSpeakerFilter()) {
+      renderRows();
+      renderStats();
+    }
     scheduleSave();
   }
 
@@ -2004,8 +2069,9 @@
     matches = [];
     currentMatchIndex = -1;
     if (query) {
-      project.sections.forEach((section) => {
+      sectionsForSearchReplace().forEach((section) => {
         section.lines.forEach((line) => {
+          if (!lineMatchesSearchReplaceFilters(line)) return;
           const fields = fieldsForScope(line, selectedScope);
           fields.forEach((field) => {
             if (field.value.includes(query)) {
@@ -2017,6 +2083,23 @@
     }
     updateMatchClasses();
     updateMatchStatus();
+  }
+
+  function sectionsForSearchReplace() {
+    if (els.replaceCurrentSectionOnlyInput?.checked) return [getActiveSection()];
+    return project.sections;
+  }
+
+  function lineMatchesSearchReplaceFilters(line) {
+    return lineMatchesSpeakerFilter(line, getActiveSpeakerFilter());
+  }
+
+  function searchReplaceScopeSuffix() {
+    const parts = [];
+    const speakerFilter = getActiveSpeakerFilter();
+    if (els.replaceCurrentSectionOnlyInput?.checked) parts.push("このセクション");
+    if (speakerFilter) parts.push(speakerFilter);
+    return parts.length ? `（${parts.join(" / ")}）` : "";
   }
 
   function fieldsForScope(line, scope) {
@@ -2076,7 +2159,7 @@
       return;
     }
     const current = matches.length && currentMatchIndex >= 0 ? `${currentMatchIndex + 1} / ` : "";
-    els.matchStatus.textContent = `${current}${matches.length}件`;
+    els.matchStatus.textContent = `${current}${matches.length}件${searchReplaceScopeSuffix()}`;
   }
 
   function replaceOne() {
@@ -2099,8 +2182,9 @@
     const query = els.searchInput.value;
     if (!query) return;
     let count = 0;
-    project.sections.forEach((section) => {
+    sectionsForSearchReplace().forEach((section) => {
       section.lines.forEach((line) => {
+        if (!lineMatchesSearchReplaceFilters(line)) return;
         const keys = selectedScope === "all" ? ["speaker", "body"] : [selectedScope];
         keys.forEach((key) => {
           const before = line[key];
@@ -2114,7 +2198,7 @@
     });
     normalizeProject();
     renderAll();
-    els.matchStatus.textContent = `${count}件置換`;
+    els.matchStatus.textContent = `${count}件置換${searchReplaceScopeSuffix()}`;
     scheduleSave();
   }
 
@@ -2141,6 +2225,7 @@
       try {
         project = hydrateProject(JSON.parse(String(reader.result)));
         activeSectionId = project.activeSectionId || project.sections[0].id;
+        activeSpeakerFilter = "";
         selectedLineIds.clear();
         lineSelectionAnchorId = "";
         lineDeleteUndoStack = [];
@@ -2192,6 +2277,50 @@
     );
   }
 
+  async function copyFilteredSpeakerGoogleDocsRichText() {
+    const speakerFilter = getActiveSpeakerFilter();
+    if (!speakerFilter) {
+      setGoogleDocsCopyStatus("左サイドバーで表示する話者を選んでください。");
+      return;
+    }
+    const sectionGroups = filteredSpeakerSectionGroups(speakerFilter);
+    const lineCount = sectionGroups.reduce((sum, group) => sum + group.lines.length, 0);
+    if (!lineCount) {
+      setGoogleDocsCopyStatus(`「${speakerFilter}」の行がありません。`);
+      return;
+    }
+    await copyGoogleDocsRichTextPayload(
+      buildGoogleDocsPasteHtmlDocument(sectionGroups),
+      buildGoogleDocsPastePlainText(sectionGroups),
+      `「${speakerFilter}」の${lineCount}行をリッチコピーしました。`
+    );
+  }
+
+  function updateFilteredGoogleDocsButton() {
+    if (!els.copyFilteredGoogleDocsButton) return;
+    const speakerFilter = getActiveSpeakerFilter();
+    const lineCount = speakerFilter
+      ? filteredSpeakerSectionGroups(speakerFilter).reduce((sum, group) => sum + group.lines.length, 0)
+      : 0;
+    els.copyFilteredGoogleDocsButton.disabled = !speakerFilter || lineCount === 0;
+    els.copyFilteredGoogleDocsButton.textContent = speakerFilter ? `表示話者コピー (${lineCount})` : "表示話者コピー";
+  }
+
+  function filteredSpeakerSectionGroups(speakerName) {
+    return project.sections
+      .map((section) => ({
+        title: section.title,
+        lines: section.lines.filter((line) => line.speaker === speakerName),
+      }))
+      .filter((group) => group.lines.length > 0);
+  }
+
+  function isSectionGroupArray(value) {
+    return Array.isArray(value) && value.every((item) => {
+      return item && typeof item.title === "string" && Array.isArray(item.lines);
+    });
+  }
+
   async function copyGoogleDocsRichTextPayload(html, plainText, successMessage) {
     try {
       if (navigator.clipboard && window.ClipboardItem) {
@@ -2229,6 +2358,7 @@
   }
 
   function buildGoogleDocsPasteHtmlBody(lines = null) {
+    if (isSectionGroupArray(lines)) return buildGoogleDocsSectionGroupsHtml(lines);
     if (Array.isArray(lines)) return buildGoogleDocsLinesHtml(lines);
     const includeSectionTitles = project.sections.length > 1;
     const blocks = [];
@@ -2240,6 +2370,24 @@
       section.lines.forEach((line, lineIndex) => {
         blocks.push(linePasteHtml(line));
         if (project.settings.exportBlankLineBetweenLines && lineIndex < section.lines.length - 1) {
+          blocks.push(blankPasteParagraphHtml());
+        }
+      });
+    });
+    return blocks.length ? blocks.join("\n") : blankPasteParagraphHtml();
+  }
+
+  function buildGoogleDocsSectionGroupsHtml(sectionGroups) {
+    const includeSectionTitles = project.sections.length > 1;
+    const blocks = [];
+    sectionGroups.forEach((group, groupIndex) => {
+      if (includeSectionTitles) {
+        if (groupIndex > 0) blocks.push(blankPasteParagraphHtml());
+        blocks.push(sectionTitlePasteHtml(group.title));
+      }
+      group.lines.forEach((line, lineIndex) => {
+        blocks.push(linePasteHtml(line));
+        if (project.settings.exportBlankLineBetweenLines && lineIndex < group.lines.length - 1) {
           blocks.push(blankPasteParagraphHtml());
         }
       });
@@ -2259,6 +2407,15 @@
   }
 
   function buildGoogleDocsPastePlainText(lines = null) {
+    if (isSectionGroupArray(lines)) {
+      const includeSectionTitles = project.sections.length > 1;
+      const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
+      const sectionTexts = lines.map((group) => {
+        const body = group.lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body)).join(lineSeparator);
+        return includeSectionTitles ? `${group.title}\n${body}` : body;
+      });
+      return sectionTexts.join("\n\n");
+    }
     if (Array.isArray(lines)) {
       const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
       return lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body)).join(lineSeparator);
@@ -2291,9 +2448,11 @@
   function bodyPasteHtml(line) {
     const runs = styledTextRuns(line.body, line.bodyMarks);
     if (!runs.length) return "";
+    const defaultColor = normalizeCssColor(getSpeakerBodyColor(project.speakers[line.speaker]));
     return runs.map((run) => {
       const styles = [`font-weight:${run.bold ? "700" : "400"}`];
-      if (run.color) styles.push(`color:${run.color}`);
+      const color = run.color || defaultColor;
+      if (color) styles.push(`color:${color}`);
       const text = escapeHtml(run.text).replace(/\n/g, "<br>");
       return `<span style="${styles.join(";")}">${text}</span>`;
     }).join("");
@@ -2363,11 +2522,12 @@
           runs.push({ text: "：", bold: false });
         }
         if (line.body) {
+          const bodyColor = normalizeCssColor(getSpeakerBodyColor(project.speakers[line.speaker]));
           styledTextRuns(line.body, line.bodyMarks).forEach((run) => {
             runs.push({
               text: run.text,
               bold: run.bold,
-              color: run.color ? normalizeDocxColor(run.color) : "",
+              color: run.color ? normalizeDocxColor(run.color) : (bodyColor ? normalizeDocxColor(bodyColor) : ""),
             });
           });
         }
