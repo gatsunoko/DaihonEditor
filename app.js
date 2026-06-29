@@ -35,6 +35,7 @@
   const els = {};
   let project = createDefaultProject();
   let activeSectionId = project.sections[0].id;
+  let allSectionsVisible = false;
   let selectedScope = "all";
   let activeSpeakerFilter = "";
   let matches = [];
@@ -235,6 +236,7 @@
       if (!confirm("現在の内容を破棄して新規作成しますか？")) return;
       project = createDefaultProject();
       activeSectionId = project.sections[0].id;
+      allSectionsVisible = false;
       activeSpeakerFilter = "";
       selectedLineIds.clear();
       lineSelectionAnchorId = "";
@@ -243,7 +245,13 @@
       renderAll();
       scheduleSave();
     });
-    els.saveJsonButton.addEventListener("click", saveJson);
+    els.saveJsonButton.addEventListener("click", () => {
+      saveJson().catch((error) => {
+        if (error?.name === "AbortError") return;
+        console.error(error);
+        alert("JSONを保存できませんでした。");
+      });
+    });
     els.loadJsonInput.addEventListener("change", loadJsonFile);
     els.exportTxtButton.addEventListener("click", exportTxt);
     els.exportDocxButton.addEventListener("click", exportDocx);
@@ -459,6 +467,7 @@
     renderExportSettings();
     renderGoogleDocsPreview();
     updateFilteredGoogleDocsButton();
+    updateFooterActionAvailability();
     updateMatches();
   }
 
@@ -466,14 +475,42 @@
     els.exportBlankLineInput.checked = Boolean(project.settings?.exportBlankLineBetweenLines);
   }
 
+  function updateFooterActionAvailability() {
+    if (els.addLineButton) {
+      els.addLineButton.disabled = allSectionsVisible;
+      els.addLineButton.title = allSectionsVisible ? "全表示中は個別セクションを選んでから行を追加してください" : "";
+    }
+    [els.copyLinesButton, els.cutLinesButton, els.pasteLinesButton].forEach((button) => {
+      if (!button) return;
+      button.disabled = allSectionsVisible;
+      button.title = allSectionsVisible ? "全表示中は行の選択操作はできません" : "";
+    });
+  }
+
   function renderGoogleDocsPreview() {
+    if (!els.googleDocsPreview) return;
     els.googleDocsPreview.innerHTML = buildGoogleDocsPasteHtmlBody();
   }
 
   function renderTabs() {
     els.sectionTabs.innerHTML = "";
+    const allItem = document.createElement("div");
+    allItem.className = `tab-item all-sections-tab${allSectionsVisible ? " active" : ""}`;
+    const allTab = document.createElement("button");
+    allTab.className = "tab";
+    allTab.type = "button";
+    allTab.setAttribute("role", "tab");
+    allTab.setAttribute("aria-selected", String(allSectionsVisible));
+    const allTitle = document.createElement("span");
+    allTitle.className = "tab-title";
+    allTitle.textContent = "全て表示";
+    allTab.appendChild(allTitle);
+    allTab.addEventListener("click", activateAllSections);
+    allItem.appendChild(allTab);
+    els.sectionTabs.appendChild(allItem);
+
     project.sections.forEach((section, index) => {
-      const isActive = section.id === activeSectionId;
+      const isActive = !allSectionsVisible && section.id === activeSectionId;
       const item = document.createElement("div");
       item.className = `tab-item${isActive ? " active" : ""}`;
 
@@ -511,13 +548,19 @@
 
   function renderRows() {
     hideSpeakerPicker();
-    const section = getActiveSection();
+    const sectionsToRender = allSectionsVisible ? project.sections : [getActiveSection()];
     const speakerFilter = getActiveSpeakerFilter();
     let visibleCount = 0;
     els.scriptRows.innerHTML = "";
-    section.lines.forEach((line, index) => {
+    sectionsToRender.forEach((section) => {
+      const heading = allSectionsVisible ? createAllSectionHeading(section) : null;
+      let sectionVisibleCount = 0;
+      if (heading) els.scriptRows.appendChild(heading);
+
+      section.lines.forEach((line, index) => {
       if (!lineMatchesSpeakerFilter(line, speakerFilter)) return;
       visibleCount += 1;
+      sectionVisibleCount += 1;
       const speaker = project.speakers[line.speaker];
       const color = speaker?.color || autoColor(line.speaker);
       const bodyColor = getSpeakerBodyColor(speaker);
@@ -527,9 +570,11 @@
       row.addEventListener("click", () => {
         focusedLineId = line.id;
       });
-      row.addEventListener("dragover", (event) => handleLineDragOver(event, row));
-      row.addEventListener("dragleave", () => clearLineDropClasses(row));
-      row.addEventListener("drop", (event) => handleLineDrop(event, line.id, row));
+      if (!allSectionsVisible) {
+        row.addEventListener("dragover", (event) => handleLineDragOver(event, row));
+        row.addEventListener("dragleave", () => clearLineDropClasses(row));
+        row.addEventListener("drop", (event) => handleLineDrop(event, line.id, row));
+      }
       row.style.setProperty("--speaker-bg", tintColor(color, 0.84));
       row.style.setProperty("--speaker-text", darkenColor(color));
       setOptionalCssVar(row, "--body-text", bodyColor);
@@ -537,22 +582,27 @@
       const number = document.createElement("div");
       number.className = "line-number";
       number.textContent = String(index + 1).padStart(3, "0");
-      number.draggable = true;
-      number.title = "クリックで選択 / ドラッグで行移動";
-      number.addEventListener("click", (event) => {
-        event.stopPropagation();
-        toggleLineSelection(line.id, event.shiftKey);
-      });
-      number.addEventListener("dragstart", (event) => {
-        const dragIds = selectedLineIds.has(line.id) ? Array.from(selectedLineIds) : [line.id];
-        event.dataTransfer.effectAllowed = "move";
-        event.dataTransfer.setData("application/x-script-line-ids", JSON.stringify(dragIds));
-        row.classList.add("dragging");
-      });
-      number.addEventListener("dragend", () => {
-        row.classList.remove("dragging");
-        clearAllLineDropClasses();
-      });
+      if (allSectionsVisible) {
+        number.draggable = false;
+        number.title = "全表示中は行移動と複数選択はできません";
+      } else {
+        number.draggable = true;
+        number.title = "クリックで選択 / ドラッグで行移動";
+        number.addEventListener("click", (event) => {
+          event.stopPropagation();
+          toggleLineSelection(line.id, event.shiftKey);
+        });
+        number.addEventListener("dragstart", (event) => {
+          const dragIds = selectedLineIds.has(line.id) ? Array.from(selectedLineIds) : [line.id];
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("application/x-script-line-ids", JSON.stringify(dragIds));
+          row.classList.add("dragging");
+        });
+        number.addEventListener("dragend", () => {
+          row.classList.remove("dragging");
+          clearAllLineDropClasses();
+        });
+      }
 
       const speakerCell = document.createElement("div");
       speakerCell.className = "speaker-cell";
@@ -593,8 +643,10 @@
         commitLineSpeaker(line);
         flushPendingSave();
       });
-      speakerInput.addEventListener("paste", (event) => handlePaste(event, index));
-      speakerInput.addEventListener("keydown", (event) => handleRowKey(event, index, "speaker"));
+      if (!allSectionsVisible) {
+        speakerInput.addEventListener("paste", (event) => handlePaste(event, index));
+        speakerInput.addEventListener("keydown", (event) => handleRowKey(event, index, "speaker"));
+      }
 
       speakerCell.append(speakerInput);
 
@@ -637,8 +689,10 @@
         captureBodySelection(line.id, bodyInput);
         resizeBodyInput(bodyInput);
       });
-      bodyInput.addEventListener("paste", (event) => handleBodyPaste(event, index));
-      bodyInput.addEventListener("keydown", (event) => handleRowKey(event, index, "body"));
+      if (!allSectionsVisible) {
+        bodyInput.addEventListener("paste", (event) => handleBodyPaste(event, index));
+        bodyInput.addEventListener("keydown", (event) => handleRowKey(event, index, "body"));
+      }
       bodyCell.append(colon, bodyInput);
       requestAnimationFrame(() => resizeBodyInput(bodyInput));
 
@@ -650,7 +704,7 @@
       deleteButton.title = "行を削除";
       deleteButton.textContent = "×";
       deleteButton.addEventListener("click", () => deleteLine(index));
-      tools.appendChild(deleteButton);
+      if (!allSectionsVisible) tools.appendChild(deleteButton);
 
       row.append(number, speakerCell, bodyCell, tools);
       els.scriptRows.appendChild(row);
@@ -666,16 +720,31 @@
         bodyInput.className = `body-input ${line.type}`;
         if (document.activeElement !== bodyInput) bodyInput.innerHTML = bodyEditorHtml(line);
       }
+      });
+      if (heading && speakerFilter && sectionVisibleCount === 0) heading.remove();
     });
     if (speakerFilter && visibleCount === 0) {
       const empty = document.createElement("div");
       empty.className = "speaker-filter-empty";
-      empty.textContent = `このセクションに「${speakerFilter}」の行はありません。`;
+      empty.textContent = "表示対象の行はありません。";
       els.scriptRows.appendChild(empty);
     }
     updateSelectedLineStatus();
     updateLineDeleteUndoButton();
     updateFilteredGoogleDocsButton();
+  }
+
+  function createAllSectionHeading(section) {
+    const heading = document.createElement("div");
+    heading.className = "all-section-heading";
+    const title = document.createElement("span");
+    title.className = "all-section-title";
+    title.textContent = section.title;
+    const count = document.createElement("span");
+    count.className = "all-section-count";
+    count.textContent = `${section.lines.length}行`;
+    heading.append(title, count);
+    return heading;
   }
 
   function resizeBodyInput(input) {
@@ -1251,7 +1320,10 @@
       return sum + countBodyChars(section.lines);
     }, 0);
     const speakerFilter = getActiveSpeakerFilter();
-    const activeLines = getActiveSection().lines.filter((line) => lineMatchesSpeakerFilter(line, speakerFilter));
+    const visibleLines = allSectionsVisible
+      ? project.sections.flatMap((section) => section.lines)
+      : getActiveSection().lines;
+    const activeLines = visibleLines.filter((line) => lineMatchesSpeakerFilter(line, speakerFilter));
     const active = countBodyChars(activeLines);
     els.totalBodyChars.textContent = total.toLocaleString("ja-JP");
     els.sectionBodyChars.textContent = active.toLocaleString("ja-JP");
@@ -1354,6 +1426,7 @@
       });
     }
     activeSectionId = section.id;
+    allSectionsVisible = false;
     project.activeSectionId = section.id;
     selectedLineIds = new Set(restored.map((line) => line.id));
     lineSelectionAnchorId = restored[0]?.id || "";
@@ -1759,8 +1832,16 @@
     return project.sections.find((section) => section.id === activeSectionId) || project.sections[0];
   }
 
+  function activateAllSections() {
+    if (allSectionsVisible) return;
+    allSectionsVisible = true;
+    clearLineSelectionState();
+    renderAll();
+  }
+
   function activateSection(sectionId) {
-    if (sectionId === activeSectionId) return;
+    if (!allSectionsVisible && sectionId === activeSectionId) return;
+    allSectionsVisible = false;
     activeSectionId = sectionId;
     project.activeSectionId = sectionId;
     clearLineSelectionState();
@@ -1795,6 +1876,7 @@
     const [section] = project.sections.splice(index, 1);
     project.sections.splice(nextIndex, 0, section);
     activeSectionId = section.id;
+    allSectionsVisible = false;
     project.activeSectionId = section.id;
     clearLineSelectionState();
     renderAll();
@@ -1829,6 +1911,7 @@
     };
     project.sections.push(section);
     activeSectionId = section.id;
+    allSectionsVisible = false;
     project.activeSectionId = section.id;
     renderAll();
     scheduleSave();
@@ -2210,11 +2293,29 @@
     return null;
   }
 
-  function saveJson() {
+  async function saveJson() {
     syncProjectTitleFromInput();
     normalizeProject();
     const data = JSON.stringify(project, null, 2);
-    downloadBlob(data, `${safeFileName(project.title)}.json`, "application/json");
+    const fileName = `${safeFileName(project.title)}.json`;
+    if (window.showSaveFilePicker) {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: fileName,
+        types: [
+          {
+            description: "JSONファイル",
+            accept: { "application/json": [".json"] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
+      await writable.close();
+      setSaveState(`JSON保存済み: ${handle.name}`);
+      return;
+    }
+    downloadBlob(data, fileName, "application/json");
+    setSaveState("JSON保存済み");
   }
 
   function loadJsonFile(event) {
@@ -2225,6 +2326,7 @@
       try {
         project = hydrateProject(JSON.parse(String(reader.result)));
         activeSectionId = project.activeSectionId || project.sections[0].id;
+        allSectionsVisible = false;
         activeSpeakerFilter = "";
         selectedLineIds.clear();
         lineSelectionAnchorId = "";
@@ -2335,12 +2437,13 @@
       }
       throw new Error("Rich clipboard is not available.");
     } catch (error) {
-      selectGoogleDocsPreview();
+      selectGoogleDocsFallbackHtml(html);
       const copied = document.execCommand && document.execCommand("copy");
+      document.getElementById("googleDocsCopyBuffer")?.remove();
       setGoogleDocsCopyStatus(
         copied
-          ? "プレビューからコピーしました。Googleドキュメントに貼り付けできます。"
-          : "自動コピーできませんでした。プレビューを選択してコピーしてください。"
+          ? "リッチ形式でコピーしました。Googleドキュメントに貼り付けできます。"
+          : "自動コピーできませんでした。ブラウザのクリップボード権限を確認してください。"
       );
     }
   }
@@ -2466,12 +2569,30 @@
     return 'margin:0; color:#111827; font-family:Arial, "Yu Gothic", "Yu Gothic UI", Meiryo, sans-serif; font-size:11pt; font-weight:400; line-height:1.65; background:transparent;';
   }
 
-  function selectGoogleDocsPreview() {
+  function selectGoogleDocsFallbackHtml(html) {
+    document.getElementById("googleDocsCopyBuffer")?.remove();
+    const buffer = document.createElement("div");
+    buffer.id = "googleDocsCopyBuffer";
+    buffer.contentEditable = "true";
+    buffer.style.position = "fixed";
+    buffer.style.left = "-10000px";
+    buffer.style.top = "0";
+    buffer.style.width = "1px";
+    buffer.style.height = "1px";
+    buffer.style.overflow = "hidden";
+    buffer.innerHTML = htmlDocumentBodyContent(html);
+    document.body.appendChild(buffer);
     const range = document.createRange();
-    range.selectNodeContents(els.googleDocsPreview);
+    range.selectNodeContents(buffer);
     const selection = window.getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
+  }
+
+  function htmlDocumentBodyContent(html) {
+    const source = String(html || "");
+    const bodyMatch = /<body[^>]*>([\s\S]*)<\/body>/i.exec(source);
+    return bodyMatch ? bodyMatch[1] : source;
   }
 
   function setGoogleDocsCopyStatus(text) {

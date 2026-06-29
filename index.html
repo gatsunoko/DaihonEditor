@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css?v=20260628-speaker-filter-replace1">
+    <link rel="stylesheet" href="styles.css?v=20260629-all-sections-view1">
   </head>
   <body>
     <div class="app-shell">
@@ -23,7 +23,7 @@
             </button>
           </div>
           <button id="newProjectButton" type="button">新規</button>
-          <button id="saveJsonButton" type="button">JSON保存</button>
+          <button id="saveJsonButton" type="button" title="保存先フォルダとファイル名を指定してJSON保存">JSON保存</button>
           <label class="file-button">
             JSON読込
             <input id="loadJsonInput" type="file" accept="application/json,.json">
@@ -146,19 +146,13 @@
               <button id="copyFilteredGoogleDocsButton" type="button" disabled>表示話者コピー</button>
               <button id="copySelectedGoogleDocsButton" type="button" disabled>選択行コピー</button>
             </div>
-            <div id="googleDocsCopyStatus" class="status-line">下のプレビューを選択してコピーすることもできます。</div>
-            <div
-              id="googleDocsPreview"
-              class="docs-paste-preview"
-              contenteditable="true"
-              aria-label="Google Docs貼り付け用プレビュー"
-            ></div>
+            <div id="googleDocsCopyStatus" class="status-line">リッチコピーできます。</div>
           </section>
 
         </aside>
       </main>
     </div>
 
-    <script src="app.js?v=20260628-speaker-filter-replace1"></script>
+    <script src="app.js?v=20260629-all-sections-view1"></script>
   </body>
 </html>
