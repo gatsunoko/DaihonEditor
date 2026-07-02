@@ -123,6 +123,8 @@
     els.speakerFilterSelect = document.getElementById("speakerFilterSelect");
     els.speakerList = document.getElementById("speakerList");
     els.exportBlankLineInput = document.getElementById("exportBlankLineInput");
+    els.exportNotesInput = document.getElementById("exportNotesInput");
+    els.exportNoteSeparatorInput = document.getElementById("exportNoteSeparatorInput");
     els.copyGoogleDocsButton = document.getElementById("copyGoogleDocsButton");
     els.copyFilteredGoogleDocsButton = document.getElementById("copyFilteredGoogleDocsButton");
     els.copySelectedGoogleDocsButton = document.getElementById("copySelectedGoogleDocsButton");
@@ -264,6 +266,16 @@
       renderGoogleDocsPreview();
       scheduleSave();
     });
+    els.exportNotesInput.addEventListener("change", () => {
+      project.settings.exportNotes = els.exportNotesInput.checked;
+      renderGoogleDocsPreview();
+      scheduleSave();
+    });
+    els.exportNoteSeparatorInput.addEventListener("change", () => {
+      project.settings.exportNoteSeparators = els.exportNoteSeparatorInput.checked;
+      renderGoogleDocsPreview();
+      scheduleSave();
+    });
     els.copyGoogleDocsButton.addEventListener("click", copyGoogleDocsRichText);
     els.copyFilteredGoogleDocsButton.addEventListener("click", copyFilteredSpeakerGoogleDocsRichText);
     els.copySelectedGoogleDocsButton.addEventListener("click", copySelectedGoogleDocsRichText);
@@ -321,6 +333,8 @@
       speakerOrder: [],
       settings: {
         exportBlankLineBetweenLines: false,
+        exportNotes: false,
+        exportNoteSeparators: false,
       },
       updatedAt: new Date().toISOString(),
     };
@@ -415,6 +429,8 @@
         ...fallback.settings,
         ...(raw.settings && typeof raw.settings === "object" ? raw.settings : {}),
         exportBlankLineBetweenLines: Boolean(raw.settings?.exportBlankLineBetweenLines),
+        exportNotes: Boolean(raw.settings?.exportNotes),
+        exportNoteSeparators: Boolean(raw.settings?.exportNoteSeparators),
       },
       updatedAt: raw.updatedAt || new Date().toISOString(),
     };
@@ -466,6 +482,8 @@
     }
     if (!project.settings || typeof project.settings !== "object") project.settings = {};
     project.settings.exportBlankLineBetweenLines = Boolean(project.settings.exportBlankLineBetweenLines);
+    project.settings.exportNotes = Boolean(project.settings.exportNotes);
+    project.settings.exportNoteSeparators = Boolean(project.settings.exportNoteSeparators);
     project.activeSectionId = activeSectionId;
     project.sections.forEach((section) => {
       if (!section.lines.length) section.lines.push(createLine());
@@ -525,6 +543,8 @@
 
   function renderExportSettings() {
     els.exportBlankLineInput.checked = Boolean(project.settings?.exportBlankLineBetweenLines);
+    els.exportNotesInput.checked = Boolean(project.settings?.exportNotes);
+    els.exportNoteSeparatorInput.checked = Boolean(project.settings?.exportNoteSeparators);
   }
 
   function updateFooterActionAvailability() {
@@ -2848,7 +2868,9 @@
     const blocks = project.sections.map((section) => {
       const body = section.lines
         .flatMap((line, lineIndex) => {
-          const parts = notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds));
+          const parts = shouldExportNotes()
+            ? notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds))
+            : [];
           parts.push(formatScriptLinePlainText(line));
           return parts;
         })
@@ -2977,11 +2999,21 @@
         if (sectionIndex > 0) blocks.push(blankPasteParagraphHtml());
         blocks.push(sectionTitlePasteHtml(section.title));
       }
+      const includeNotes = shouldExportNotes();
+      const noteBoundaries = includeNotes && project.settings.exportNoteSeparators ? noteRangeBoundaries(section) : null;
       section.lines.forEach((line, lineIndex) => {
-        notesStartingAtLine(section, lineIndex).forEach(({ note, bounds }) => {
-          blocks.push(notePasteHtml(note, bounds));
-        });
+        if (noteBoundaries?.starts.has(lineIndex) && !noteBoundaryContinuesFromPreviousLine(noteBoundaries, lineIndex)) {
+          blocks.push(noteRangeSeparatorPasteHtml("start"));
+        }
+        if (includeNotes) {
+          notesStartingAtLine(section, lineIndex).forEach(({ note, bounds }) => {
+            blocks.push(notePasteHtml(note, bounds));
+          });
+        }
         blocks.push(linePasteHtml(line));
+        if (noteBoundaries?.ends.has(lineIndex)) {
+          blocks.push(noteRangeSeparatorPasteHtml("end"));
+        }
         if (project.settings.exportBlankLineBetweenLines && lineIndex < section.lines.length - 1) {
           blocks.push(blankPasteParagraphHtml());
         }
@@ -3037,7 +3069,9 @@
     const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
     const sectionTexts = project.sections.map((section) => {
       const lines = section.lines.flatMap((line, lineIndex) => {
-        const parts = notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds));
+        const parts = shouldExportNotes()
+          ? notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds))
+          : [];
         parts.push(formatScriptLinePlainText(line));
         return parts;
       });
@@ -3065,6 +3099,32 @@
   function notePasteHtml(note, bounds) {
     const label = formatNotePlainText(note, bounds);
     return `<p style="${pasteParagraphStyle()} color:#1d4ed8; background:#eff6ff;"><strong>${escapeHtml(label)}</strong></p>`;
+  }
+
+  function shouldExportNotes() {
+    return Boolean(project.settings?.exportNotes);
+  }
+
+  function noteRangeBoundaries(section) {
+    const starts = new Set();
+    const ends = new Set();
+    (section.notes || []).forEach((note) => {
+      if (!String(note.text || "").trim()) return;
+      const bounds = noteRangeBounds(section, note);
+      if (!bounds) return;
+      starts.add(bounds.startIndex);
+      ends.add(bounds.endIndex);
+    });
+    return { starts, ends };
+  }
+
+  function noteBoundaryContinuesFromPreviousLine(noteBoundaries, lineIndex) {
+    return lineIndex > 0 && noteBoundaries.ends.has(lineIndex - 1);
+  }
+
+  function noteRangeSeparatorPasteHtml(position) {
+    const margin = position === "start" ? "8pt 0 5pt 0" : "5pt 0 8pt 0";
+    return `<hr style="border:0; border-top:1.5pt solid #60a5fa; margin:${margin}; height:0;">`;
   }
 
   function bodyPasteHtml(line) {
@@ -3152,9 +3212,11 @@
       if (sectionIndex > 0) paragraphs.push(paragraphXml([], "Spacer"));
       paragraphs.push(paragraphXml([{ text: section.title, bold: true }], "SectionHeading"));
       section.lines.forEach((line, lineIndex) => {
-        notesStartingAtLine(section, lineIndex).forEach(({ note, bounds }) => {
-          paragraphs.push(paragraphXml([{ text: formatNotePlainText(note, bounds), bold: true, color: "1D4ED8" }], "NoteLine"));
-        });
+        if (shouldExportNotes()) {
+          notesStartingAtLine(section, lineIndex).forEach(({ note, bounds }) => {
+            paragraphs.push(paragraphXml([{ text: formatNotePlainText(note, bounds), bold: true, color: "1D4ED8" }], "NoteLine"));
+          });
+        }
         const runs = [];
         if (line.speaker) {
           runs.push({
