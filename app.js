@@ -4,7 +4,10 @@
   const STORAGE_KEY = "script-editor-project-v1";
   const UI_STORAGE_KEY = "script-editor-ui-v1";
   const SPEAKER_DRAG_TYPE = "application/x-script-speaker-name";
+  const NOTE_END_DRAG_TYPE = "application/x-script-note-end";
   const MAX_LINE_DELETE_UNDO = 30;
+  const DEFAULT_NOTE_KIND = "note";
+  const DEFAULT_NOTE_COLOR = "#dbeafe";
   const TYPE_LABELS = {
     dialogue: "会話",
     direction: "ト書き",
@@ -46,6 +49,7 @@
   let lineClipboard = [];
   let lineDeleteUndoStack = [];
   let focusedLineId = "";
+  let noteEndDrag = null;
   let bodySelection = null;
   let bodySelectionRange = null;
   let suppressBodyFocusScroll = false;
@@ -166,7 +170,7 @@
       }
       if (isUndoShortcut(event) && lineDeleteUndoStack.length && !isEditableTarget(event.target)) {
         event.preventDefault();
-        undoDeletedLines();
+        undoLastAction();
       }
     });
     document.addEventListener("selectionchange", updateBodySelectionFromDocument);
@@ -188,7 +192,7 @@
     els.addLineButton.addEventListener("click", () => {
       addLineAfter(getActiveSection().lines.length - 1);
     });
-    els.undoDeleteLineButton.addEventListener("click", undoDeletedLines);
+    els.undoDeleteLineButton.addEventListener("click", undoLastAction);
     els.clearSelectedLinesButton.addEventListener("click", clearLineSelection);
     els.copyLinesButton.addEventListener("click", copySelectedLines);
     els.cutLinesButton.addEventListener("click", cutSelectedLines);
@@ -310,6 +314,7 @@
           id: sectionId,
           title: "01 オープニング",
           lines: [createLine()],
+          notes: [],
         },
       ],
       speakers: {},
@@ -402,13 +407,7 @@
       title: typeof raw.title === "string" ? raw.title : fallback.title,
       activeSectionId: typeof raw.activeSectionId === "string" ? raw.activeSectionId : raw.sections[0]?.id,
       sections: raw.sections.length
-        ? raw.sections.map((section, sectionIndex) => ({
-            id: section.id || makeId("section"),
-            title: section.title || `${String(sectionIndex + 1).padStart(2, "0")} セクション`,
-            lines: Array.isArray(section.lines) && section.lines.length
-              ? section.lines.map(hydrateLine)
-              : [createLine()],
-          }))
+        ? raw.sections.map(hydrateSection)
         : fallback.sections,
       speakers: raw.speakers && typeof raw.speakers === "object" ? raw.speakers : {},
       speakerOrder: Array.isArray(raw.speakerOrder) ? raw.speakerOrder.filter((name) => typeof name === "string") : [],
@@ -418,6 +417,18 @@
         exportBlankLineBetweenLines: Boolean(raw.settings?.exportBlankLineBetweenLines),
       },
       updatedAt: raw.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  function hydrateSection(section, sectionIndex) {
+    const lines = Array.isArray(section.lines) && section.lines.length
+      ? section.lines.map(hydrateLine)
+      : [createLine()];
+    return {
+      id: section.id || makeId("section"),
+      title: section.title || `${String(sectionIndex + 1).padStart(2, "0")} セクション`,
+      lines,
+      notes: Array.isArray(section.notes) ? section.notes.map(hydrateNote) : [],
     };
   }
 
@@ -432,6 +443,19 @@
       bodyMarks: normalizeBodyMarks(line.bodyMarks, body.length),
       type: TYPE_LABELS[line.type] ? line.type : inferType(line.speaker || "", line.body || ""),
       speakerCommitted: typeof line.speakerCommitted === "boolean" ? line.speakerCommitted : Boolean(speaker && body.trim()),
+    };
+  }
+
+  function hydrateNote(note) {
+    const startLineId = typeof note?.startLineId === "string" ? note.startLineId : "";
+    const endLineId = typeof note?.endLineId === "string" ? note.endLineId : startLineId;
+    return {
+      id: note?.id || makeId("note"),
+      kind: typeof note?.kind === "string" && note.kind ? note.kind : DEFAULT_NOTE_KIND,
+      text: typeof note?.text === "string" ? note.text : "",
+      color: normalizeNoteColor(note?.color),
+      startLineId,
+      endLineId,
     };
   }
 
@@ -453,9 +477,37 @@
         line.speakerCommitted = Boolean(line.speakerCommitted);
         if (shouldAutoRegisterSpeaker(line)) ensureSpeaker(line.speaker, undefined, true);
       });
+      section.notes = normalizeSectionNotes(section);
     });
     pruneUnusedAutoSpeakers();
     syncSpeakerOrder();
+  }
+
+  function normalizeSectionNotes(section) {
+    const lineIds = new Set(section.lines.map((line) => line.id));
+    const notes = Array.isArray(section.notes) ? section.notes.map(hydrateNote) : [];
+    return notes
+      .map((note) => {
+        const hasStart = lineIds.has(note.startLineId);
+        const hasEnd = lineIds.has(note.endLineId);
+        if (!hasStart && !hasEnd) return null;
+        const startLineId = hasStart ? note.startLineId : note.endLineId;
+        const endLineId = hasEnd ? note.endLineId : startLineId;
+        const normalized = { ...note, startLineId, endLineId };
+        return orderNoteEndpoints(section, normalized);
+      })
+      .filter(Boolean);
+  }
+
+  function orderNoteEndpoints(section, note) {
+    const startIndex = section.lines.findIndex((line) => line.id === note.startLineId);
+    const endIndex = section.lines.findIndex((line) => line.id === note.endLineId);
+    if (startIndex < 0 || endIndex < 0 || startIndex <= endIndex) return note;
+    return {
+      ...note,
+      startLineId: note.endLineId,
+      endLineId: note.startLineId,
+    };
   }
 
   function renderAll() {
@@ -566,6 +618,7 @@
       const bodyColor = getSpeakerBodyColor(speaker);
       const row = document.createElement("div");
       row.className = `script-row${selectedLineIds.has(line.id) ? " selected" : ""}`;
+      row.dataset.sectionId = section.id;
       row.dataset.lineId = line.id;
       row.addEventListener("click", () => {
         focusedLineId = line.id;
@@ -604,8 +657,14 @@
         });
       }
 
+      const noteState = noteStateForLine(section, index);
+      const noteCell = createNoteCell(section, line, index, noteState);
+
       const speakerCell = document.createElement("div");
       speakerCell.className = "speaker-cell";
+      const speakerHighlight = document.createElement("div");
+      speakerHighlight.className = "speaker-highlight-layer";
+      speakerHighlight.setAttribute("aria-hidden", "true");
       const speakerInput = document.createElement("input");
       speakerInput.className = "speaker-input";
       speakerInput.type = "text";
@@ -648,7 +707,7 @@
         speakerInput.addEventListener("keydown", (event) => handleRowKey(event, index, "speaker"));
       }
 
-      speakerCell.append(speakerInput);
+      speakerCell.append(speakerHighlight, speakerInput);
 
       const bodyCell = document.createElement("div");
       bodyCell.className = "body-cell";
@@ -706,7 +765,7 @@
       deleteButton.addEventListener("click", () => deleteLine(index));
       if (!allSectionsVisible) tools.appendChild(deleteButton);
 
-      row.append(number, speakerCell, bodyCell, tools);
+      row.append(number, noteCell, speakerCell, bodyCell, tools);
       els.scriptRows.appendChild(row);
 
       function syncRowVisual() {
@@ -718,8 +777,10 @@
         setOptionalCssVar(row, "--body-text", nextBodyColor);
         colon.textContent = line.speaker ? "：" : "";
         bodyInput.className = `body-input ${line.type}`;
+        syncSpeakerSearchHighlight(speakerCell, speakerHighlight, line);
         if (document.activeElement !== bodyInput) bodyInput.innerHTML = bodyEditorHtml(line);
       }
+      syncSpeakerSearchHighlight(speakerCell, speakerHighlight, line);
       });
       if (heading && speakerFilter && sectionVisibleCount === 0) heading.remove();
     });
@@ -747,6 +808,266 @@
     return heading;
   }
 
+  function createNoteCell(section, line, lineIndex, noteState) {
+    const cell = document.createElement("div");
+    cell.className = "note-cell";
+    const readOnly = allSectionsVisible;
+    if (!readOnly) {
+      cell.addEventListener("click", (event) => {
+        if (event.target.closest("button") || event.target.closest(".note-text")) return;
+        event.stopPropagation();
+        if (noteState) {
+          focusNoteEditor(noteState.note.id);
+          return;
+        }
+        addNoteFromCellClick(section, lineIndex);
+      });
+    }
+
+    if (!noteState) return cell;
+
+    const { note, bounds, extraCount } = noteState;
+    const isStart = lineIndex === bounds.startIndex;
+    const isEnd = lineIndex === bounds.endIndex;
+    cell.classList.add("has-note");
+    if (isStart) cell.classList.add("note-start");
+    if (isEnd) cell.classList.add("note-end");
+    if (!isStart && !isEnd) cell.classList.add("note-middle");
+    if (noteEndDrag?.noteId === note.id) {
+      cell.classList.add("note-active");
+    }
+    cell.style.setProperty("--note-bg", note.color || DEFAULT_NOTE_COLOR);
+
+    const rail = document.createElement("div");
+    rail.className = "note-rail";
+    cell.appendChild(rail);
+
+    if (isStart) {
+      const content = document.createElement("div");
+      content.className = "note-card";
+
+      const text = document.createElement("div");
+      text.className = "note-text";
+      text.contentEditable = !readOnly;
+      text.setAttribute("role", "textbox");
+      text.setAttribute("aria-label", "備考");
+      text.dataset.noteId = note.id;
+      text.dataset.placeholder = "備考を入力";
+      text.textContent = note.text || "";
+      if (!readOnly) {
+        text.addEventListener("input", () => {
+          note.text = editablePlainText(text);
+          renderGoogleDocsPreview();
+          markSavePending();
+        });
+        text.addEventListener("focus", () => {
+          focusedLineId = line.id;
+        });
+        text.addEventListener("blur", () => handleNoteTextBlur(section.id, note.id, text));
+        text.addEventListener("paste", pastePlainTextIntoEditable);
+      }
+      content.append(text);
+      if (extraCount > 0) {
+        const overlap = document.createElement("div");
+        overlap.className = "note-overlap-count";
+        overlap.textContent = `+${extraCount}`;
+        content.appendChild(overlap);
+      }
+      cell.appendChild(content);
+    }
+
+    if (isEnd && !readOnly) {
+      const handle = document.createElement("button");
+      handle.className = "note-end-handle";
+      handle.type = "button";
+      handle.title = "ドラッグして備考の終点を変更";
+      handle.textContent = "↕";
+      handle.draggable = true;
+      handle.addEventListener("dragstart", (event) => {
+        noteEndDrag = { sectionId: section.id, noteId: note.id };
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData(NOTE_END_DRAG_TYPE, JSON.stringify(noteEndDrag));
+      });
+      handle.addEventListener("dragend", () => {
+        noteEndDrag = null;
+        clearAllLineDropClasses();
+        renderRows();
+      });
+      cell.appendChild(handle);
+    }
+
+    return cell;
+  }
+
+  function editablePlainText(editor) {
+    return String(editor.innerText || "").replace(/\r\n/g, "\n").replace(/\n$/, "");
+  }
+
+  function noteStateForLine(section, lineIndex) {
+    const hits = (section.notes || [])
+      .map((note) => {
+        const bounds = noteRangeBounds(section, note);
+        if (!bounds || lineIndex < bounds.startIndex || lineIndex > bounds.endIndex) return null;
+        return { note, bounds };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.bounds.startIndex - b.bounds.startIndex || a.bounds.endIndex - b.bounds.endIndex);
+    if (!hits.length) return null;
+    return { ...hits[0], extraCount: hits.length - 1 };
+  }
+
+  function noteRangeBounds(section, note) {
+    const startIndex = section.lines.findIndex((line) => line.id === note.startLineId);
+    const endIndex = section.lines.findIndex((line) => line.id === note.endLineId);
+    if (startIndex < 0 || endIndex < 0) return null;
+    return {
+      startIndex: Math.min(startIndex, endIndex),
+      endIndex: Math.max(startIndex, endIndex),
+    };
+  }
+
+  function notesStartingAtLine(section, lineIndex) {
+    return (section.notes || [])
+      .filter((note) => String(note.text || "").trim())
+      .map((note) => ({ note, bounds: noteRangeBounds(section, note) }))
+      .filter((item) => item.bounds && item.bounds.startIndex === lineIndex);
+  }
+
+  function formatNoteRange(bounds) {
+    const start = bounds.startIndex + 1;
+    const end = bounds.endIndex + 1;
+    return start === end ? String(start).padStart(3, "0") : `${String(start).padStart(3, "0")}-${String(end).padStart(3, "0")}`;
+  }
+
+  function addNoteFromCellClick(section, lineIndex) {
+    if (allSectionsVisible) {
+      alert("備考はセクションを1つ選んだ状態で追加してください。");
+      return;
+    }
+    const bounds = noteBoundsForCellClick(section, lineIndex);
+    createNoteForBounds(section, bounds);
+  }
+
+  function noteBoundsForCellClick(section, lineIndex) {
+    const clickedLine = section.lines[lineIndex];
+    if (!clickedLine || !selectedLineIds.has(clickedLine.id)) {
+      return { startIndex: lineIndex, endIndex: lineIndex };
+    }
+    return currentNoteSelectionBounds(section) || { startIndex: lineIndex, endIndex: lineIndex };
+  }
+
+  function createNoteForBounds(section, bounds) {
+    if (!bounds) return;
+    if (hasNoteOverlap(section, bounds.startIndex, bounds.endIndex)) {
+      alert("既存の備考と重なる範囲には追加できません。先に範囲を調整してください。");
+      return;
+    }
+    if (!Array.isArray(section.notes)) section.notes = [];
+    const note = {
+      id: makeId("note"),
+      kind: DEFAULT_NOTE_KIND,
+      text: "",
+      color: DEFAULT_NOTE_COLOR,
+      startLineId: section.lines[bounds.startIndex].id,
+      endLineId: section.lines[bounds.endIndex].id,
+    };
+    section.notes.push(note);
+    normalizeProject();
+    renderAll();
+    requestAnimationFrame(() => focusNoteEditor(note.id));
+  }
+
+  function currentNoteSelectionBounds(section) {
+    const selectedIndexes = section.lines
+      .map((line, index) => (selectedLineIds.has(line.id) ? index : -1))
+      .filter((index) => index >= 0);
+    if (selectedIndexes.length) {
+      return {
+        startIndex: Math.min(...selectedIndexes),
+        endIndex: Math.max(...selectedIndexes),
+      };
+    }
+    const focusedIndex = focusedLineId ? section.lines.findIndex((line) => line.id === focusedLineId) : -1;
+    if (focusedIndex < 0) return null;
+    return { startIndex: focusedIndex, endIndex: focusedIndex };
+  }
+
+  function hasNoteOverlap(section, startIndex, endIndex, ignoreNoteId = "") {
+    return (section.notes || []).some((note) => {
+      if (note.id === ignoreNoteId) return false;
+      const bounds = noteRangeBounds(section, note);
+      if (!bounds) return false;
+      return startIndex <= bounds.endIndex && endIndex >= bounds.startIndex;
+    });
+  }
+
+  function handleNoteTextBlur(sectionId, noteId, editor) {
+    const note = findSectionNote(sectionId, noteId);
+    if (!note) return;
+    note.text = editablePlainText(editor);
+    if (!note.text.trim()) {
+      removeNote(sectionId, noteId);
+      return;
+    }
+    flushPendingSave();
+  }
+
+  function focusNoteEditor(noteId) {
+    const editor = els.scriptRows.querySelector(`.note-text[data-note-id="${cssEscape(noteId)}"]`);
+    if (!editor) return;
+    editor.focus();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function removeNote(sectionId, noteId) {
+    const section = project.sections.find((item) => item.id === sectionId);
+    if (!section || !Array.isArray(section.notes)) return;
+    section.notes = section.notes.filter((item) => item.id !== noteId);
+    if (noteEndDrag?.noteId === noteId) noteEndDrag = null;
+    renderAll();
+    scheduleSave();
+  }
+
+  function canSetNoteEndToLine(sectionId, noteId, lineId) {
+    const section = project.sections.find((item) => item.id === sectionId);
+    const note = findSectionNote(sectionId, noteId);
+    if (!section || !note) return false;
+    const startIndex = section.lines.findIndex((line) => line.id === note.startLineId);
+    const targetIndex = section.lines.findIndex((line) => line.id === lineId);
+    return startIndex >= 0 && targetIndex >= startIndex;
+  }
+
+  function setNoteEndToLine(sectionId, noteId, lineId) {
+    const section = project.sections.find((item) => item.id === sectionId);
+    const note = findSectionNote(sectionId, noteId);
+    if (!section || !note) return;
+    if (!canSetNoteEndToLine(sectionId, noteId, lineId)) {
+      alert("終点は開始行より下の行にしてください。");
+      return;
+    }
+    const targetIndex = section.lines.findIndex((line) => line.id === lineId);
+    if (hasNoteOverlap(section, section.lines.findIndex((line) => line.id === note.startLineId), targetIndex, noteId)) {
+      alert("既存の備考と重なる範囲には変更できません。");
+      return;
+    }
+    note.endLineId = lineId;
+    noteEndDrag = null;
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+  }
+
+  function findSectionNote(sectionId, noteId) {
+    const section = project.sections.find((item) => item.id === sectionId);
+    if (!section || !Array.isArray(section.notes)) return null;
+    return section.notes.find((note) => note.id === noteId) || null;
+  }
+
   function resizeBodyInput(input) {
     input.style.height = "auto";
     input.style.height = `${input.scrollHeight}px`;
@@ -772,13 +1093,60 @@
   function bodyEditorHtml(line) {
     const runs = styledTextRuns(line.body, line.bodyMarks);
     if (!runs.length) return "";
+    const query = searchQueryForField("body");
+    const current = currentMatchForLineField(line.id, "body");
+    let offset = 0;
     return runs.map((run) => {
       const styles = [];
       if (run.bold) styles.push("font-weight:900");
       if (run.color) styles.push(`color:${run.color}`);
-      const text = escapeHtml(run.text).replace(/\n/g, "<br>");
+      const text = highlightSearchText(run.text, query, offset, current?.start ?? -1).replace(/\n/g, "<br>");
+      offset += run.text.length;
       return styles.length ? `<span style="${styles.join(";")}">${text}</span>` : text;
     }).join("");
+  }
+
+  function searchQueryForField(field) {
+    const query = String(els.searchInput?.value || "");
+    if (!query) return "";
+    if (selectedScope !== "all" && selectedScope !== field) return "";
+    return query;
+  }
+
+  function currentMatchForLineField(lineId, field) {
+    const current = matches[currentMatchIndex];
+    if (!current || current.lineId !== lineId || current.field !== field) return null;
+    return current;
+  }
+
+  function highlightSearchText(text, query, baseOffset = 0, currentStart = -1) {
+    const source = String(text || "");
+    if (!query) return escapeHtml(source);
+    let html = "";
+    let cursor = 0;
+    let index = source.indexOf(query, cursor);
+    while (index >= 0) {
+      html += escapeHtml(source.slice(cursor, index));
+      const absoluteStart = baseOffset + index;
+      const className = absoluteStart === currentStart ? "search-hit current-search-hit" : "search-hit";
+      html += `<mark class="${className}">${escapeHtml(source.slice(index, index + query.length))}</mark>`;
+      cursor = index + query.length;
+      index = source.indexOf(query, cursor);
+    }
+    html += escapeHtml(source.slice(cursor));
+    return html;
+  }
+
+  function syncSpeakerSearchHighlight(cell, layer, line) {
+    const query = searchQueryForField("speaker");
+    const hasHighlight = Boolean(query && line.speaker.includes(query));
+    cell.classList.toggle("search-highlight-visible", hasHighlight);
+    if (!hasHighlight) {
+      layer.textContent = "";
+      return;
+    }
+    const current = currentMatchForLineField(line.id, "speaker");
+    layer.innerHTML = highlightSearchText(line.speaker, query, 0, current?.start ?? -1);
   }
 
   function styledTextRuns(text, marks) {
@@ -1365,9 +1733,7 @@
   }
 
   function clearLineSelection() {
-    selectedLineIds.clear();
-    lineSelectionAnchorId = "";
-    focusedLineId = "";
+    clearLineSelectionState();
     renderRows();
   }
 
@@ -1383,23 +1749,63 @@
     if (!els.undoDeleteLineButton) return;
     els.undoDeleteLineButton.disabled = lineDeleteUndoStack.length === 0;
     const latest = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
-    const count = latest?.lines?.length || 0;
-    els.undoDeleteLineButton.textContent = count > 1 ? `${count}行の削除を元に戻す` : "削除を元に戻す";
+    els.undoDeleteLineButton.textContent = "Undo";
+    els.undoDeleteLineButton.title = latest ? undoTitleForEntry(latest) : "元に戻す";
+  }
+
+  function undoTitleForEntry(entry) {
+    if (entry?.type === "replace") return "直前の置換を元に戻す";
+    const count = entry?.lines?.length || 0;
+    return count > 1 ? `${count}行の削除を元に戻す` : "直前の削除を元に戻す";
   }
 
   function pushLineDeleteUndo(entry) {
     if (!entry?.lines?.length) return;
+    pushUndoEntry({ ...entry, type: "line-delete" });
+  }
+
+  function pushReplaceUndo(projectSnapshot) {
+    if (!projectSnapshot) return;
+    pushUndoEntry({
+      type: "replace",
+      project: projectSnapshot,
+      activeSectionId,
+      allSectionsVisible,
+      activeSpeakerFilter,
+    });
+  }
+
+  function pushUndoEntry(entry) {
     lineDeleteUndoStack.push(entry);
     if (lineDeleteUndoStack.length > MAX_LINE_DELETE_UNDO) lineDeleteUndoStack.shift();
     updateLineDeleteUndoButton();
   }
 
-  function undoDeletedLines() {
+  function undoLastAction() {
     const entry = lineDeleteUndoStack.pop();
     if (!entry) {
       updateLineDeleteUndoButton();
       return;
     }
+    if (entry.type === "replace") {
+      undoReplace(entry);
+      return;
+    }
+    undoDeletedLines(entry);
+  }
+
+  function undoReplace(entry) {
+    project = hydrateProject(entry.project);
+    activeSectionId = entry.activeSectionId || project.activeSectionId || project.sections[0].id;
+    allSectionsVisible = Boolean(entry.allSectionsVisible);
+    activeSpeakerFilter = entry.activeSpeakerFilter || "";
+    clearLineSelectionState();
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+  }
+
+  function undoDeletedLines(entry) {
     const section = project.sections.find((item) => item.id === entry.sectionId);
     if (!section) {
       updateLineDeleteUndoButton();
@@ -1425,6 +1831,7 @@
         restored.push(restoredLine);
       });
     }
+    if (Array.isArray(entry.notes)) section.notes = entry.notes.map(hydrateNote);
     activeSectionId = section.id;
     allSectionsVisible = false;
     project.activeSectionId = section.id;
@@ -1441,6 +1848,10 @@
   }
 
   function handleLineDragOver(event, row) {
+    if (isNoteEndDrag(event)) {
+      handleNoteEndDragOver(event, row);
+      return;
+    }
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
     const rect = row.getBoundingClientRect();
@@ -1451,6 +1862,11 @@
 
   function handleLineDrop(event, targetLineId, row) {
     event.preventDefault();
+    if (isNoteEndDrag(event)) {
+      handleNoteEndDrop(event, targetLineId);
+      clearAllLineDropClasses();
+      return;
+    }
     const raw = event.dataTransfer.getData("application/x-script-line-ids");
     clearAllLineDropClasses();
     if (!raw) return;
@@ -1461,11 +1877,31 @@
   }
 
   function clearLineDropClasses(row) {
-    row.classList.remove("drop-before", "drop-after");
+    row.classList.remove("drop-before", "drop-after", "note-end-target", "note-end-invalid");
   }
 
   function clearAllLineDropClasses() {
     els.scriptRows.querySelectorAll(".script-row").forEach(clearLineDropClasses);
+  }
+
+  function isNoteEndDrag(event) {
+    return Array.from(event.dataTransfer?.types || []).includes(NOTE_END_DRAG_TYPE) || Boolean(noteEndDrag);
+  }
+
+  function handleNoteEndDragOver(event, row) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const targetLineId = row.dataset.lineId;
+    const canDrop = noteEndDrag && canSetNoteEndToLine(noteEndDrag.sectionId, noteEndDrag.noteId, targetLineId);
+    row.classList.toggle("note-end-target", canDrop);
+    row.classList.toggle("note-end-invalid", !canDrop);
+  }
+
+  function handleNoteEndDrop(event, targetLineId) {
+    const raw = event.dataTransfer.getData(NOTE_END_DRAG_TYPE);
+    const payload = raw ? JSON.parse(raw) : noteEndDrag;
+    if (!payload) return;
+    setNoteEndToLine(payload.sectionId, payload.noteId, targetLineId);
   }
 
   function moveLines(lineIds, targetLineId, after) {
@@ -1505,6 +1941,7 @@
       sectionId: section.id,
       index: Math.max(0, firstIndex),
       mode: selected.length === section.lines.length ? "replace-blank" : "insert",
+      notes: cloneSectionNotes(section),
       lines: selected.map(cloneLineForDeleteUndo),
       items: selected.map((line) => ({
         index: section.lines.findIndex((item) => item.id === line.id),
@@ -1572,6 +2009,14 @@
       type: line.type,
       speakerCommitted: Boolean(line.speakerCommitted),
     };
+  }
+
+  function cloneProjectForUndo() {
+    return JSON.parse(JSON.stringify(project));
+  }
+
+  function cloneSectionNotes(section) {
+    return Array.isArray(section.notes) ? section.notes.map((note) => ({ ...note })) : [];
   }
 
   function cloneLineForDeleteUndo(line) {
@@ -1853,6 +2298,7 @@
     selectedLineIds.clear();
     lineSelectionAnchorId = "";
     focusedLineId = "";
+    noteEndDrag = null;
   }
 
   function createSectionActionButton(title, label, onClick, modifier = "") {
@@ -1908,6 +2354,7 @@
       id: makeId("section"),
       title,
       lines: [createLine()],
+      notes: [],
     };
     project.sections.push(section);
     activeSectionId = section.id;
@@ -1945,6 +2392,7 @@
       sectionId: section.id,
       index,
       mode: section.lines.length === 1 ? "replace-blank" : "insert",
+      notes: cloneSectionNotes(section),
       lines: [cloneLineForDeleteUndo(removedLine)],
       items: [{ index, line: cloneLineForDeleteUndo(removedLine) }],
     };
@@ -1959,8 +2407,16 @@
     selectedLineIds.delete(removedLine.id);
     if (lineSelectionAnchorId === removedLine?.id) lineSelectionAnchorId = "";
     if (focusedLineId === removedLine?.id) focusedLineId = "";
+    normalizeProject();
     renderAll();
     scheduleSave();
+  }
+
+  function pastePlainTextIntoEditable(event) {
+    const text = event.clipboardData?.getData("text/plain") || event.clipboardData?.getData("text") || "";
+    if (!text) return;
+    event.preventDefault();
+    document.execCommand("insertText", false, text);
   }
 
   function handlePaste(event, index) {
@@ -2157,14 +2613,19 @@
           if (!lineMatchesSearchReplaceFilters(line)) return;
           const fields = fieldsForScope(line, selectedScope);
           fields.forEach((field) => {
-            if (field.value.includes(query)) {
-              matches.push({ sectionId: section.id, lineId: line.id, field: field.key });
+            let start = 0;
+            let index = String(field.value || "").indexOf(query, start);
+            while (index >= 0) {
+              matches.push({ sectionId: section.id, lineId: line.id, field: field.key, start: index });
+              start = index + query.length;
+              index = String(field.value || "").indexOf(query, start);
             }
           });
         });
       });
     }
     updateMatchClasses();
+    refreshSearchHighlights();
     updateMatchStatus();
   }
 
@@ -2202,9 +2663,12 @@
       activeSectionId = match.sectionId;
       project.activeSectionId = match.sectionId;
       renderAll();
-      currentMatchIndex = matches.findIndex((item) => item.lineId === match.lineId && item.field === match.field);
+      currentMatchIndex = matches.findIndex((item) => {
+        return item.lineId === match.lineId && item.field === match.field && item.start === match.start;
+      });
     }
     updateMatchClasses();
+    refreshSearchHighlights(true);
     updateMatchStatus();
     focusMatch(match);
   }
@@ -2215,24 +2679,37 @@
     row.scrollIntoView({ block: "center", behavior: "smooth" });
     const input = row.querySelector(match.field === "speaker" ? ".speaker-input" : ".body-input");
     input?.focus();
-    if (typeof input?.select === "function") {
-      input.select();
+    const queryLength = String(els.searchInput.value || "").length;
+    if (typeof input?.setSelectionRange === "function") {
+      input.setSelectionRange(match.start, match.start + queryLength);
     } else if (input) {
-      const range = document.createRange();
-      range.selectNodeContents(input);
-      const selection = window.getSelection();
-      selection.removeAllRanges();
-      selection.addRange(range);
+      setEditorSelection(input, match.start, match.start + queryLength);
     }
   }
 
   function updateMatchClasses() {
-    const activeIds = new Set(matches.filter((match) => match.sectionId === activeSectionId).map((match) => match.lineId));
+    const visibleMatches = allSectionsVisible ? matches : matches.filter((match) => match.sectionId === activeSectionId);
+    const activeIds = new Set(visibleMatches.map((match) => match.lineId));
     els.scriptRows.querySelectorAll(".script-row").forEach((row) => {
       const isMatch = activeIds.has(row.dataset.lineId);
       const current = matches[currentMatchIndex];
       row.classList.toggle("match", isMatch);
       row.classList.toggle("current-match", Boolean(current && current.lineId === row.dataset.lineId));
+    });
+  }
+
+  function refreshSearchHighlights(force = false) {
+    els.scriptRows.querySelectorAll(".script-row").forEach((row) => {
+      const line = findLine(row.dataset.lineId);
+      if (!line) return;
+      const speakerCell = row.querySelector(".speaker-cell");
+      const speakerLayer = row.querySelector(".speaker-highlight-layer");
+      if (speakerCell && speakerLayer) syncSpeakerSearchHighlight(speakerCell, speakerLayer, line);
+      const bodyInput = row.querySelector(".body-input");
+      if (bodyInput && (force || document.activeElement !== bodyInput)) {
+        bodyInput.innerHTML = bodyEditorHtml(line);
+        resizeBodyInput(bodyInput);
+      }
     });
   }
 
@@ -2254,8 +2731,18 @@
     const match = matches[currentMatchIndex];
     const line = findLine(match.lineId);
     if (!line) return;
-    line[match.field] = line[match.field].replace(query, els.replaceInput.value);
+    const value = String(line[match.field] || "");
+    const start = value.slice(match.start, match.start + query.length) === query ? match.start : value.indexOf(query);
+    if (start < 0) {
+      updateMatches();
+      return;
+    }
+    const nextValue = value.slice(0, start) + els.replaceInput.value + value.slice(start + query.length);
+    if (nextValue === value) return;
+    const undoSnapshot = cloneProjectForUndo();
+    line[match.field] = nextValue;
     if (match.field === "body") line.bodyMarks = [];
+    pushReplaceUndo(undoSnapshot);
     normalizeProject();
     renderAll();
     scheduleSave();
@@ -2265,6 +2752,7 @@
     const query = els.searchInput.value;
     if (!query) return;
     let count = 0;
+    const undoSnapshot = cloneProjectForUndo();
     sectionsForSearchReplace().forEach((section) => {
       section.lines.forEach((line) => {
         if (!lineMatchesSearchReplaceFilters(line)) return;
@@ -2279,6 +2767,11 @@
         });
       });
     });
+    if (!count) {
+      els.matchStatus.textContent = `0件置換${searchReplaceScopeSuffix()}`;
+      return;
+    }
+    pushReplaceUndo(undoSnapshot);
     normalizeProject();
     renderAll();
     els.matchStatus.textContent = `${count}件置換${searchReplaceScopeSuffix()}`;
@@ -2296,7 +2789,7 @@
   async function saveJson() {
     syncProjectTitleFromInput();
     normalizeProject();
-    const data = JSON.stringify(project, null, 2);
+    const data = JSON.stringify(projectForSave(), null, 2);
     const fileName = `${safeFileName(project.title)}.json`;
     if (window.showSaveFilePicker) {
       const handle = await window.showSaveFilePicker({
@@ -2354,11 +2847,25 @@
     const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
     const blocks = project.sections.map((section) => {
       const body = section.lines
-        .map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body))
+        .flatMap((line, lineIndex) => {
+          const parts = notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds));
+          parts.push(formatScriptLinePlainText(line));
+          return parts;
+        })
         .join(lineSeparator);
       return `# ${section.title}\n${body}`;
     });
     return blocks.join("\n\n");
+  }
+
+  function formatScriptLinePlainText(line) {
+    return line.speaker ? `${line.speaker}：${line.body}` : line.body;
+  }
+
+  function formatNotePlainText(note, bounds) {
+    const text = String(note.text || "").trim();
+    const range = formatNoteRange(bounds);
+    return text ? `[${range}] ${text}` : `[${range}]`;
   }
 
   async function copyGoogleDocsRichText() {
@@ -2471,6 +2978,9 @@
         blocks.push(sectionTitlePasteHtml(section.title));
       }
       section.lines.forEach((line, lineIndex) => {
+        notesStartingAtLine(section, lineIndex).forEach(({ note, bounds }) => {
+          blocks.push(notePasteHtml(note, bounds));
+        });
         blocks.push(linePasteHtml(line));
         if (project.settings.exportBlankLineBetweenLines && lineIndex < section.lines.length - 1) {
           blocks.push(blankPasteParagraphHtml());
@@ -2526,7 +3036,11 @@
     const includeSectionTitles = project.sections.length > 1;
     const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
     const sectionTexts = project.sections.map((section) => {
-      const lines = section.lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body));
+      const lines = section.lines.flatMap((line, lineIndex) => {
+        const parts = notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds));
+        parts.push(formatScriptLinePlainText(line));
+        return parts;
+      });
       const body = lines.join(lineSeparator);
       return includeSectionTitles ? `${section.title}\n${body}` : body;
     });
@@ -2546,6 +3060,11 @@
     }
     parts.push(bodyPasteHtml(line));
     return `<p style="${pasteParagraphStyle()}">${parts.join("") || "<br>"}</p>`;
+  }
+
+  function notePasteHtml(note, bounds) {
+    const label = formatNotePlainText(note, bounds);
+    return `<p style="${pasteParagraphStyle()} color:#1d4ed8; background:#eff6ff;"><strong>${escapeHtml(label)}</strong></p>`;
   }
 
   function bodyPasteHtml(line) {
@@ -2633,6 +3152,9 @@
       if (sectionIndex > 0) paragraphs.push(paragraphXml([], "Spacer"));
       paragraphs.push(paragraphXml([{ text: section.title, bold: true }], "SectionHeading"));
       section.lines.forEach((line, lineIndex) => {
+        notesStartingAtLine(section, lineIndex).forEach(({ note, bounds }) => {
+          paragraphs.push(paragraphXml([{ text: formatNotePlainText(note, bounds), bold: true, color: "1D4ED8" }], "NoteLine"));
+        });
         const runs = [];
         if (line.speaker) {
           runs.push({
@@ -2750,6 +3272,21 @@
     <w:pPr>
       <w:spacing w:after="70" w:line="276" w:lineRule="auto"/>
     </w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="NoteLine">
+    <w:name w:val="Range Note Line"/>
+    <w:basedOn w:val="Normal"/>
+    <w:qFormat/>
+    <w:pPr>
+      <w:spacing w:before="70" w:after="30" w:line="240" w:lineRule="auto"/>
+    </w:pPr>
+    <w:rPr>
+      <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:eastAsia="Yu Gothic"/>
+      <w:b/>
+      <w:sz w:val="20"/>
+      <w:szCs w:val="20"/>
+      <w:color w:val="1D4ED8"/>
+    </w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="ExportBlankLine">
     <w:name w:val="Export Blank Line"/>
@@ -2967,9 +3504,21 @@
   function saveProjectNow() {
     project.updatedAt = new Date().toISOString();
     project.activeSectionId = activeSectionId;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(projectForSave()));
     hasPendingSave = false;
     setSaveState(`LocalStorageに自動保存済み ${new Date().toLocaleTimeString("ja-JP")}`);
+  }
+
+  function projectForSave() {
+    return {
+      ...project,
+      sections: project.sections.map((section) => ({
+        ...section,
+        notes: Array.isArray(section.notes)
+          ? section.notes.filter((note) => String(note.text || "").trim())
+          : [],
+      })),
+    };
   }
 
   function scheduleRender() {
@@ -3053,6 +3602,10 @@
       return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
     }
     return "";
+  }
+
+  function normalizeNoteColor(value) {
+    return normalizeCssColor(value) || DEFAULT_NOTE_COLOR;
   }
 
   function safeFileName(name) {
