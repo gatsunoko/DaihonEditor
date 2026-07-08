@@ -690,7 +690,7 @@
       speakerInput.type = "text";
       speakerInput.value = line.speaker;
       speakerInput.placeholder = line.type === "dialogue" ? "話者名" : TYPE_LABELS[line.type];
-      speakerInput.addEventListener("input", () => {
+      speakerInput.addEventListener("input", () => preserveEditorScroll(() => {
         line.speaker = cleanSpeakerName(speakerInput.value);
         line.speakerCommitted = false;
         line.type = inferType(line.speaker, line.body, line.type);
@@ -704,7 +704,7 @@
         renderGoogleDocsPreview();
         updateMatches();
         markSavePending();
-      });
+      }));
       speakerInput.addEventListener("focus", () => {
         flushPendingSave();
         focusedLineId = line.id;
@@ -741,7 +741,7 @@
       bodyInput.setAttribute("aria-label", "本文");
       bodyInput.dataset.placeholder = "本文";
       bodyInput.innerHTML = bodyEditorHtml(line);
-      bodyInput.addEventListener("input", () => {
+      bodyInput.addEventListener("input", () => preserveEditorScroll(() => {
         syncBodyEditorToLine(bodyInput, line);
         line.type = inferType(line.speaker, line.body, line.type);
         if (shouldAutoRegisterSpeaker(line)) ensureSpeaker(line.speaker, undefined, true);
@@ -753,7 +753,7 @@
         renderGoogleDocsPreview();
         updateMatches();
         markSavePending();
-      });
+      }));
       bodyInput.addEventListener("focus", () => {
         flushPendingSave();
         focusedLineId = line.id;
@@ -764,10 +764,10 @@
       bodyInput.addEventListener("beforeinput", () => captureBodySelection(line.id, bodyInput));
       bodyInput.addEventListener("blur", flushPendingSave);
       bodyInput.addEventListener("mouseup", () => captureBodySelection(line.id, bodyInput));
-      bodyInput.addEventListener("keyup", () => {
+      bodyInput.addEventListener("keyup", () => preserveEditorScroll(() => {
         captureBodySelection(line.id, bodyInput);
         resizeBodyInput(bodyInput);
-      });
+      }));
       if (!allSectionsVisible) {
         bodyInput.addEventListener("paste", (event) => handleBodyPaste(event, index));
         bodyInput.addEventListener("keydown", (event) => handleRowKey(event, index, "body"));
@@ -875,11 +875,11 @@
       text.dataset.placeholder = "備考を入力";
       text.textContent = note.text || "";
       if (!readOnly) {
-        text.addEventListener("input", () => {
+        text.addEventListener("input", () => preserveEditorScroll(() => {
           note.text = editablePlainText(text);
           renderGoogleDocsPreview();
           markSavePending();
-        });
+        }));
         text.addEventListener("focus", () => {
           focusedLineId = line.id;
         });
@@ -1091,6 +1091,30 @@
   function resizeBodyInput(input) {
     input.style.height = "auto";
     input.style.height = `${input.scrollHeight}px`;
+  }
+
+  function preserveEditorScroll(callback) {
+    const position = captureEditorScrollPosition();
+    const result = callback();
+    restoreEditorScrollPosition(position);
+    requestAnimationFrame(() => restoreEditorScrollPosition(position));
+    return result;
+  }
+
+  function captureEditorScrollPosition() {
+    return {
+      rowsScrollTop: els.scriptRows ? els.scriptRows.scrollTop : 0,
+      windowX: window.scrollX,
+      windowY: window.scrollY,
+    };
+  }
+
+  function restoreEditorScrollPosition(position) {
+    if (!position) return;
+    if (els.scriptRows) els.scriptRows.scrollTop = position.rowsScrollTop;
+    if (window.scrollX !== position.windowX || window.scrollY !== position.windowY) {
+      window.scrollTo(position.windowX, position.windowY);
+    }
   }
 
   function getActiveSpeakerFilter() {
@@ -2996,7 +3020,7 @@
     const blocks = [];
     project.sections.forEach((section, sectionIndex) => {
       if (includeSectionTitles) {
-        if (sectionIndex > 0) blocks.push(blankPasteParagraphHtml());
+        if (sectionIndex > 0) blocks.push(sectionSeparatorPasteHtml());
         blocks.push(sectionTitlePasteHtml(section.title));
       }
       const includeNotes = shouldExportNotes();
@@ -3083,6 +3107,10 @@
 
   function sectionTitlePasteHtml(title) {
     return `<p style="${pasteParagraphStyle()} margin-top:10px; margin-bottom:6px;"><strong>${escapeHtml(title)}</strong></p>`;
+  }
+
+  function sectionSeparatorPasteHtml() {
+    return '<hr data-section-separator="true" style="border:0; border-top:2pt solid #9ca3af; margin:12pt 0 10pt 0; height:0;">';
   }
 
   function linePasteHtml(line) {
