@@ -7,6 +7,7 @@
   const FILE_HANDLE_DB_NAME = "script-editor-file-handles-v1";
   const FILE_HANDLE_STORE_NAME = "handles";
   const JSON_SAVE_HANDLE_KEY = "last-json-save-file";
+  const JSON_AUTO_SAVE_DELAY = 2000;
   const SPEAKER_DRAG_TYPE = "application/x-script-speaker-name";
   const NOTE_END_DRAG_TYPE = "application/x-script-note-end";
   const MAX_LINE_DELETE_UNDO = 30;
@@ -59,6 +60,11 @@
   let suppressBodyFocusScroll = false;
   let hasPendingSave = false;
   let saveTimer = 0;
+  let jsonAutoSaveTimer = 0;
+  let jsonAutoSaveRunning = false;
+  let jsonAutoSaveQueued = false;
+  let jsonAutoSavePromise = null;
+  let jsonAutoSaveTargetVersion = 0;
   let renderTimer = 0;
   let compactSidebarQuery = null;
   let narrowSidebarQuery = null;
@@ -66,6 +72,7 @@
   let settingsDrawerOpen = false;
   let lastJsonSaveHandle = null;
   let lastJsonSaveHandleLoaded = false;
+  let lastJsonSaveHandleLoadPromise = null;
   let uiState = {
     speakerPaneVisible: true,
     settingsPaneVisible: true,
@@ -84,6 +91,7 @@
     renderAll();
     updateBodyColorButton();
     setSaveState("LocalStorageに自動保存済み");
+    showRememberedJsonAutoSaveState();
   }
 
   function cacheElements() {
@@ -249,6 +257,7 @@
     });
     els.newProjectButton.addEventListener("click", () => {
       if (!confirm("現在の内容を破棄して新規作成しますか？")) return;
+      forgetRememberedJsonSaveHandle();
       project = createDefaultProject();
       activeSectionId = project.sections[0].id;
       allSectionsVisible = false;
@@ -3086,15 +3095,25 @@
     const fileName = `${safeFileName(project.title)}.json`;
     if (window.showSaveFilePicker) {
       const handle = await showJsonSaveFilePicker(fileName);
+      clearTimeout(jsonAutoSaveTimer);
+      jsonAutoSaveTimer = 0;
+      jsonAutoSaveQueued = false;
+      if (jsonAutoSavePromise) {
+        try {
+          await jsonAutoSavePromise;
+        } catch (_error) {
+          // 手動保存を続行するため、自動保存側の失敗はここでは無視します。
+        }
+      }
       const writable = await handle.createWritable();
       await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
       await writable.close();
       await rememberJsonSaveHandle(handle);
-      setSaveState(`JSON保存済み: ${handle.name}`);
+      setSaveState(`JSON保存・自動保存先を設定済み: ${handle.name}`);
       return;
     }
     downloadBlob(data, fileName, "application/json");
-    setSaveState("JSON保存済み");
+    setSaveState("JSON保存済み（このブラウザではJSON自動保存を利用できません）");
   }
 
   async function showJsonSaveFilePicker(fileName) {
@@ -3123,16 +3142,32 @@
 
   async function getRememberedJsonSaveHandle() {
     if (lastJsonSaveHandleLoaded) return lastJsonSaveHandle;
-    lastJsonSaveHandleLoaded = true;
-    try {
-      lastJsonSaveHandle = await readFileHandle(JSON_SAVE_HANDLE_KEY);
-    } catch (error) {
-      console.warn("前回のJSON保存先を読み込めませんでした。", error);
+    if (!lastJsonSaveHandleLoadPromise) {
+      lastJsonSaveHandleLoadPromise = readFileHandle(JSON_SAVE_HANDLE_KEY)
+        .then((handle) => {
+          if (!lastJsonSaveHandleLoaded) {
+            lastJsonSaveHandle = handle;
+            lastJsonSaveHandleLoaded = true;
+          }
+          return lastJsonSaveHandle;
+        })
+        .catch((error) => {
+          console.warn("前回のJSON保存先を読み込めませんでした。", error);
+          if (!lastJsonSaveHandleLoaded) {
+            lastJsonSaveHandle = null;
+            lastJsonSaveHandleLoaded = true;
+          }
+          return lastJsonSaveHandle;
+        })
+        .finally(() => {
+          lastJsonSaveHandleLoadPromise = null;
+        });
     }
-    return lastJsonSaveHandle;
+    return lastJsonSaveHandleLoadPromise;
   }
 
   async function rememberJsonSaveHandle(handle) {
+    jsonAutoSaveTargetVersion += 1;
     lastJsonSaveHandle = handle;
     lastJsonSaveHandleLoaded = true;
     try {
@@ -3143,6 +3178,10 @@
   }
 
   async function forgetRememberedJsonSaveHandle() {
+    jsonAutoSaveTargetVersion += 1;
+    clearTimeout(jsonAutoSaveTimer);
+    jsonAutoSaveTimer = 0;
+    jsonAutoSaveQueued = false;
     lastJsonSaveHandle = null;
     lastJsonSaveHandleLoaded = true;
     try {
@@ -3230,6 +3269,7 @@
         lineSelectionAnchorId = "";
         lineDeleteUndoStack = [];
         focusedLineId = "";
+        forgetRememberedJsonSaveHandle();
         normalizeProject();
         renderAll();
         scheduleSave();
@@ -4018,9 +4058,15 @@
   }
 
   function flushPendingSave() {
-    if (!hasPendingSave) return;
-    clearTimeout(saveTimer);
-    saveProjectNow();
+    if (hasPendingSave) {
+      clearTimeout(saveTimer);
+      saveProjectNow();
+    }
+    if (jsonAutoSaveTimer) {
+      clearTimeout(jsonAutoSaveTimer);
+      jsonAutoSaveTimer = 0;
+      startJsonAutoSave();
+    }
   }
 
   function saveProjectNow() {
@@ -4029,6 +4075,84 @@
     localStorage.setItem(STORAGE_KEY, JSON.stringify(projectForSave()));
     hasPendingSave = false;
     setSaveState(`LocalStorageに自動保存済み ${new Date().toLocaleTimeString("ja-JP")}`);
+    scheduleJsonAutoSave();
+  }
+
+  function scheduleJsonAutoSave(delay = JSON_AUTO_SAVE_DELAY) {
+    clearTimeout(jsonAutoSaveTimer);
+    jsonAutoSaveTimer = window.setTimeout(() => {
+      jsonAutoSaveTimer = 0;
+      startJsonAutoSave();
+    }, delay);
+  }
+
+  function startJsonAutoSave() {
+    if (jsonAutoSaveRunning) {
+      jsonAutoSaveQueued = true;
+      return jsonAutoSavePromise || Promise.resolve();
+    }
+
+    jsonAutoSaveRunning = true;
+    jsonAutoSavePromise = performJsonAutoSave()
+      .catch((error) => {
+        console.warn("JSONを自動保存できませんでした。", error);
+        if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+          setSaveState("LocalStorageに保存済み（JSON自動保存の再設定が必要です）");
+          return;
+        }
+        setSaveState("JSON自動保存に失敗しました（LocalStorageには保存済みです）");
+      })
+      .finally(() => {
+        jsonAutoSaveRunning = false;
+        jsonAutoSavePromise = null;
+        if (!jsonAutoSaveQueued) return;
+        jsonAutoSaveQueued = false;
+        scheduleJsonAutoSave(0);
+      });
+    return jsonAutoSavePromise;
+  }
+
+  async function performJsonAutoSave() {
+    const targetVersion = jsonAutoSaveTargetVersion;
+    const handle = await getRememberedJsonSaveHandle();
+    if (!handle) return;
+
+    if (typeof handle.queryPermission === "function") {
+      const permission = await handle.queryPermission({ mode: "readwrite" });
+      if (permission !== "granted") {
+        setSaveState(`LocalStorageに保存済み（JSON自動保存の再設定が必要: ${handle.name}）`);
+        return;
+      }
+    }
+
+    if (targetVersion !== jsonAutoSaveTargetVersion) return;
+    const data = JSON.stringify(projectForSave(), null, 2);
+    const writable = await handle.createWritable();
+    await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
+    await writable.close();
+    if (targetVersion !== jsonAutoSaveTargetVersion) return;
+    setSaveState(`LocalStorage・JSONに自動保存済み ${new Date().toLocaleTimeString("ja-JP")} : ${handle.name}`);
+  }
+
+  async function showRememberedJsonAutoSaveState() {
+    const targetVersion = jsonAutoSaveTargetVersion;
+    try {
+      const handle = await getRememberedJsonSaveHandle();
+      if (!handle) return;
+
+      if (typeof handle.queryPermission === "function") {
+        const permission = await handle.queryPermission({ mode: "readwrite" });
+        if (permission !== "granted") {
+          setSaveState(`LocalStorageに自動保存済み（JSON自動保存の再設定が必要: ${handle.name}）`);
+          return;
+        }
+      }
+      if (targetVersion !== jsonAutoSaveTargetVersion) return;
+      setSaveState(`LocalStorageに自動保存済み / JSON自動保存先: ${handle.name}`);
+      scheduleJsonAutoSave(0);
+    } catch (error) {
+      console.warn("JSON自動保存先の状態を確認できませんでした。", error);
+    }
   }
 
   function projectForSave() {
