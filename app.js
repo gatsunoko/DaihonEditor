@@ -3,6 +3,10 @@
 
   const STORAGE_KEY = "script-editor-project-v1";
   const UI_STORAGE_KEY = "script-editor-ui-v1";
+  const JSON_SAVE_PICKER_ID = "script-editor-json-save";
+  const FILE_HANDLE_DB_NAME = "script-editor-file-handles-v1";
+  const FILE_HANDLE_STORE_NAME = "handles";
+  const JSON_SAVE_HANDLE_KEY = "last-json-save-file";
   const SPEAKER_DRAG_TYPE = "application/x-script-speaker-name";
   const NOTE_END_DRAG_TYPE = "application/x-script-note-end";
   const MAX_LINE_DELETE_UNDO = 30;
@@ -60,6 +64,8 @@
   let narrowSidebarQuery = null;
   let speakerDrawerOpen = false;
   let settingsDrawerOpen = false;
+  let lastJsonSaveHandle = null;
+  let lastJsonSaveHandleLoaded = false;
   let uiState = {
     speakerPaneVisible: true,
     settingsPaneVisible: true,
@@ -126,6 +132,8 @@
     els.exportNotesInput = document.getElementById("exportNotesInput");
     els.exportNoteSeparatorInput = document.getElementById("exportNoteSeparatorInput");
     els.copyGoogleDocsButton = document.getElementById("copyGoogleDocsButton");
+    els.copySpeakersOnlyGoogleDocsButton = document.getElementById("copySpeakersOnlyGoogleDocsButton");
+    els.copyCurrentSectionGoogleDocsButton = document.getElementById("copyCurrentSectionGoogleDocsButton");
     els.copyFilteredGoogleDocsButton = document.getElementById("copyFilteredGoogleDocsButton");
     els.copySelectedGoogleDocsButton = document.getElementById("copySelectedGoogleDocsButton");
     els.googleDocsCopyStatus = document.getElementById("googleDocsCopyStatus");
@@ -177,7 +185,7 @@
     });
     document.addEventListener("selectionchange", updateBodySelectionFromDocument);
     window.addEventListener("resize", hideSpeakerPicker);
-    window.addEventListener("scroll", hideSpeakerPicker, true);
+    window.addEventListener("scroll", handleSpeakerPickerScroll, true);
     window.addEventListener("beforeunload", flushPendingSave);
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") flushPendingSave();
@@ -190,6 +198,7 @@
     });
     els.projectTitle.addEventListener("blur", flushPendingSave);
 
+    els.addSectionButton.addEventListener("mousedown", (event) => event.preventDefault());
     els.addSectionButton.addEventListener("click", addSection);
     els.addLineButton.addEventListener("click", () => {
       addLineAfter(getActiveSection().lines.length - 1);
@@ -277,10 +286,17 @@
       scheduleSave();
     });
     els.copyGoogleDocsButton.addEventListener("click", copyGoogleDocsRichText);
+    els.copySpeakersOnlyGoogleDocsButton.addEventListener("click", copySpeakersOnlyGoogleDocsRichText);
+    els.copyCurrentSectionGoogleDocsButton.addEventListener("click", copyCurrentSectionGoogleDocsRichText);
     els.copyFilteredGoogleDocsButton.addEventListener("click", copyFilteredSpeakerGoogleDocsRichText);
     els.copySelectedGoogleDocsButton.addEventListener("click", copySelectedGoogleDocsRichText);
 
     els.searchInput.addEventListener("input", updateMatches);
+    els.searchInput.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      moveMatch(1, false);
+    });
     els.replaceCurrentSectionOnlyInput.addEventListener("change", updateMatches);
     document.querySelectorAll(".scope-button").forEach((button) => {
       button.addEventListener("click", () => {
@@ -536,6 +552,7 @@
     renderStats();
     renderExportSettings();
     renderGoogleDocsPreview();
+    updateCurrentSectionGoogleDocsButton();
     updateFilteredGoogleDocsButton();
     updateFooterActionAvailability();
     updateMatches();
@@ -577,6 +594,7 @@
     allTitle.className = "tab-title";
     allTitle.textContent = "全て表示";
     allTab.appendChild(allTitle);
+    allTab.addEventListener("mousedown", (event) => activateSectionTabFromPointer(event, activateAllSections));
     allTab.addEventListener("click", activateAllSections);
     allItem.appendChild(allTab);
     els.sectionTabs.appendChild(allItem);
@@ -599,6 +617,9 @@
       dot.className = "tab-dot";
       tab.append(title, dot);
 
+      tab.addEventListener("mousedown", (event) => {
+        activateSectionTabFromPointer(event, () => activateSection(section.id));
+      });
       tab.addEventListener("click", () => activateSection(section.id));
       tab.addEventListener("dblclick", () => renameSection(section.id));
 
@@ -616,6 +637,24 @@
       item.append(tab, actions);
       els.sectionTabs.appendChild(item);
     });
+  }
+
+  function activateSectionTabFromPointer(event, activate) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+
+    const windowX = window.scrollX;
+    const windowY = window.scrollY;
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && focused !== event.currentTarget) {
+      focused.blur();
+    }
+
+    activate();
+
+    const restoreWindowPosition = () => window.scrollTo(windowX, windowY);
+    restoreWindowPosition();
+    requestAnimationFrame(restoreWindowPosition);
   }
 
   function renderRows() {
@@ -736,6 +775,7 @@
       colon.textContent = line.speaker ? "：" : "";
       const bodyInput = document.createElement("div");
       bodyInput.className = `body-input ${line.type}`;
+      bodyInput.classList.toggle("speakerless-direction", line.type === "direction" && !line.speaker);
       bodyInput.contentEditable = "true";
       bodyInput.setAttribute("role", "textbox");
       bodyInput.setAttribute("aria-label", "本文");
@@ -797,6 +837,7 @@
         setOptionalCssVar(row, "--body-text", nextBodyColor);
         colon.textContent = line.speaker ? "：" : "";
         bodyInput.className = `body-input ${line.type}`;
+        bodyInput.classList.toggle("speakerless-direction", line.type === "direction" && !line.speaker);
         syncSpeakerSearchHighlight(speakerCell, speakerHighlight, line);
         if (document.activeElement !== bodyInput) bodyInput.innerHTML = bodyEditorHtml(line);
       }
@@ -883,6 +924,7 @@
         text.addEventListener("focus", () => {
           focusedLineId = line.id;
         });
+        text.addEventListener("keydown", (event) => handleNoteKey(event, section, lineIndex, note, text));
         text.addEventListener("blur", () => handleNoteTextBlur(section.id, note.id, text));
         text.addEventListener("paste", pastePlainTextIntoEditable);
       }
@@ -1032,6 +1074,38 @@
     flushPendingSave();
   }
 
+  function handleNoteKey(event, section, lineIndex, note, editor) {
+    if (event.key !== "Tab" || event.shiftKey) return;
+    const nextLineIndex = lineIndex + 1;
+    if (!section.lines[nextLineIndex]) return;
+
+    event.preventDefault();
+    note.text = editablePlainText(editor);
+    if (!note.text.trim()) {
+      section.notes = section.notes.filter((item) => item.id !== note.id);
+    }
+
+    let nextNoteState = noteStateForLine(section, nextLineIndex);
+    if (!nextNoteState) {
+      const nextLine = section.lines[nextLineIndex];
+      const nextNote = {
+        id: makeId("note"),
+        kind: DEFAULT_NOTE_KIND,
+        text: "",
+        color: DEFAULT_NOTE_COLOR,
+        startLineId: nextLine.id,
+        endLineId: nextLine.id,
+      };
+      section.notes.push(nextNote);
+      nextNoteState = { note: nextNote };
+    }
+
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+    requestAnimationFrame(() => focusNoteEditor(nextNoteState.note.id));
+  }
+
   function focusNoteEditor(noteId) {
     const editor = els.scriptRows.querySelector(`.note-text[data-note-id="${cssEscape(noteId)}"]`);
     if (!editor) return;
@@ -1089,8 +1163,9 @@
   }
 
   function resizeBodyInput(input) {
-    input.style.height = "auto";
-    input.style.height = `${input.scrollHeight}px`;
+    // contenteditable の div は内容と幅に合わせて自動で伸縮する。
+    // 固定高を残すと、サイドバー開閉後に折り返しが減っても行だけ縮まない。
+    input.style.removeProperty("height");
   }
 
   function preserveEditorScroll(callback) {
@@ -2152,6 +2227,11 @@
     picker.style.minWidth = `${rect.width}px`;
   }
 
+  function handleSpeakerPickerScroll(event) {
+    if (speakerPicker && event.target instanceof Node && speakerPicker.element.contains(event.target)) return;
+    hideSpeakerPicker();
+  }
+
   function hideSpeakerPicker() {
     if (!speakerPicker) return;
     speakerPicker.element.remove();
@@ -2391,7 +2471,9 @@
     scheduleSave();
   }
 
-  function addSection() {
+  function addSection(event) {
+    event?.preventDefault();
+    const buttonTop = els.addSectionButton.getBoundingClientRect().top;
     const next = project.sections.length + 1;
     const title = `${String(next).padStart(2, "0")} 新規セクション`;
     const section = {
@@ -2404,8 +2486,40 @@
     activeSectionId = section.id;
     allSectionsVisible = false;
     project.activeSectionId = section.id;
+    clearLineSelectionState();
+    bodySelection = null;
+    bodySelectionRange = null;
+    normalizeProject();
     renderAll();
+    restoreSectionAddViewport(buttonTop);
+    revealActiveSectionTab();
     scheduleSave();
+  }
+
+  function restoreSectionAddViewport(buttonTop) {
+    if (!Number.isFinite(buttonTop)) return;
+    const restore = () => {
+      const nextButtonTop = els.addSectionButton.getBoundingClientRect().top;
+      if (Number.isFinite(nextButtonTop)) window.scrollBy(0, nextButtonTop - buttonTop);
+    };
+    restore();
+    requestAnimationFrame(restore);
+  }
+
+  function revealActiveSectionTab() {
+    const reveal = () => {
+      const activeItem = els.sectionTabs.querySelector(".tab-item.active");
+      if (!activeItem) return;
+      const tabsRect = els.sectionTabs.getBoundingClientRect();
+      const itemRect = activeItem.getBoundingClientRect();
+      if (itemRect.right > tabsRect.right) {
+        els.sectionTabs.scrollLeft += itemRect.right - tabsRect.right;
+      } else if (itemRect.left < tabsRect.left) {
+        els.sectionTabs.scrollLeft -= tabsRect.left - itemRect.left;
+      }
+    };
+    reveal();
+    requestAnimationFrame(reveal);
   }
 
   function renameSection(sectionId) {
@@ -2415,6 +2529,7 @@
     if (!nextTitle || !nextTitle.trim()) return;
     section.title = nextTitle.trim();
     renderTabs();
+    updateCurrentSectionGoogleDocsButton();
     scheduleSave();
   }
 
@@ -2486,8 +2601,141 @@
       handlePaste(event, index);
       return;
     }
+    const richHtml = event.clipboardData?.getData("text/html") || "";
+    if (richHtml) {
+      const bodyHtml = sanitizeBodyClipboardHtml(richHtml);
+      if (bodyHtml) {
+        const clipboardBody = document.createElement("div");
+        clipboardBody.innerHTML = bodyHtml;
+        const clipboardText = editorPlainText(clipboardBody);
+        const clipboardMarks = extractBodyMarks(clipboardBody, clipboardText.length);
+        const alignedClipboard = alignStyledBodyClipboard(clipboardText, clipboardMarks, text);
+        if (
+          alignedClipboard?.marks.length &&
+          insertStyledBodyPaste(event.currentTarget, index, alignedClipboard.text, alignedClipboard.marks)
+        ) {
+          event.preventDefault();
+          return;
+        }
+      }
+    }
     event.preventDefault();
     document.execCommand("insertText", false, text);
+  }
+
+  function alignStyledBodyClipboard(richText, richMarks, plainText) {
+    const source = String(richText || "");
+    const expected = String(plainText || "");
+    if (!expected) return null;
+    const matchStart = source.indexOf(expected);
+    if (matchStart < 0) return null;
+    const matchEnd = matchStart + expected.length;
+    const marks = normalizeBodyMarks(richMarks, source.length)
+      .filter((mark) => mark.start < matchEnd && mark.end > matchStart)
+      .map((mark) => ({
+        ...mark,
+        start: Math.max(mark.start, matchStart) - matchStart,
+        end: Math.min(mark.end, matchEnd) - matchStart,
+      }));
+    return {
+      text: expected,
+      marks: mergeBodyMarks(normalizeBodyMarks(marks, expected.length)),
+    };
+  }
+
+  function insertStyledBodyPaste(editor, index, pastedText, pastedMarks) {
+    if (!editor?.classList?.contains("body-input")) return false;
+    const section = getActiveSection();
+    const line = section.lines[index];
+    if (!line) return false;
+    const offsets = selectionOffsetsForEditor(editor);
+    if (!offsets) return false;
+
+    const start = Math.min(offsets.start, offsets.end);
+    const end = Math.max(offsets.start, offsets.end);
+    const previousText = line.body;
+    const nextText = `${previousText.slice(0, start)}${pastedText}${previousText.slice(end)}`;
+    const delta = pastedText.length - (end - start);
+    const nextMarks = [];
+
+    normalizeBodyMarks(line.bodyMarks, previousText.length).forEach((mark) => {
+      if (mark.start < start) {
+        nextMarks.push({ ...mark, end: Math.min(mark.end, start) });
+      }
+      if (mark.end > end) {
+        nextMarks.push({
+          ...mark,
+          start: Math.max(mark.start, end) + delta,
+          end: mark.end + delta,
+        });
+      }
+    });
+    normalizeBodyMarks(pastedMarks, pastedText.length).forEach((mark) => {
+      nextMarks.push({
+        ...mark,
+        start: start + mark.start,
+        end: start + mark.end,
+      });
+    });
+
+    line.body = nextText;
+    line.bodyMarks = mergeBodyMarks(normalizeBodyMarks(nextMarks, nextText.length));
+    line.type = inferType(line.speaker, line.body, line.type);
+    if (shouldAutoRegisterSpeaker(line)) ensureSpeaker(line.speaker, undefined, true);
+    pruneUnusedAutoSpeakers();
+    const caret = start + pastedText.length;
+    bodySelection = { lineId: line.id, start: caret, end: caret };
+    renderAll();
+    restoreBodySelectionAfterRender(bodySelection);
+    markSavePending();
+    return true;
+  }
+
+  function sanitizeBodyClipboardHtml(html) {
+    const container = document.createElement("div");
+    container.innerHTML = String(html || "");
+    const parts = [];
+    const ignoredTags = new Set(["HEAD", "META", "LINK", "SCRIPT", "STYLE", "TITLE"]);
+
+    const appendText = (text, style) => {
+      if (!text) return;
+      const styles = [];
+      if (style.bold) styles.push("font-weight:900");
+      if (style.color) styles.push(`color:${style.color}`);
+      const escaped = escapeHtml(text).replace(/\r\n?|\n/g, "<br>");
+      parts.push(styles.length ? `<span style="${styles.join(";")}">${escaped}</span>` : escaped);
+    };
+
+    const walk = (node, inherited) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        appendText(node.nodeValue || "", inherited);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const element = node;
+      if (ignoredTags.has(element.tagName)) return;
+      if (element.tagName === "BR") {
+        parts.push("<br>");
+        return;
+      }
+
+      const next = { ...inherited };
+      const weight = String(element.style?.fontWeight || "").toLowerCase();
+      if (
+        element.tagName === "B" ||
+        element.tagName === "STRONG" ||
+        weight === "bold" ||
+        Number.parseInt(weight, 10) >= 600
+      ) {
+        next.bold = true;
+      }
+      const color = normalizeCssColor(element.style?.color || (element.tagName === "FONT" ? element.getAttribute("color") : ""));
+      if (color) next.color = color;
+      Array.from(element.childNodes).forEach((child) => walk(child, next));
+    };
+
+    Array.from(container.childNodes).forEach((child) => walk(child, { bold: false, color: "" }));
+    return parts.join("");
   }
 
   function handleRowKey(event, index, field) {
@@ -2580,7 +2828,7 @@
     if (["SE", "SFX", "効果音"].includes(name) || /効果音|SE[:：\s]|SFX[:：\s]/i.test(source)) return "sfx";
     if (!speaker && /^[（(【\[]/.test(body.trim())) return "direction";
     if (["ト書き", "ナレーション"].includes(cleanSpeakerName(speaker))) return "direction";
-    return fallback && fallback !== "dialogue" ? fallback : "dialogue";
+    return fallback && !["dialogue", "direction"].includes(fallback) ? fallback : "dialogue";
   }
 
   function ensureSpeaker(name, preferredColor, auto, preferredBodyColor) {
@@ -2699,7 +2947,7 @@
     ];
   }
 
-  function moveMatch(delta) {
+  function moveMatch(delta, focusInput = true) {
     if (!matches.length) return;
     currentMatchIndex = (currentMatchIndex + delta + matches.length) % matches.length;
     const match = matches[currentMatchIndex];
@@ -2714,13 +2962,14 @@
     updateMatchClasses();
     refreshSearchHighlights(true);
     updateMatchStatus();
-    focusMatch(match);
+    focusMatch(match, focusInput);
   }
 
-  function focusMatch(match) {
+  function focusMatch(match, focusInput = true) {
     const row = els.scriptRows.querySelector(`[data-line-id="${cssEscape(match.lineId)}"]`);
     if (!row) return;
     row.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (!focusInput) return;
     const input = row.querySelector(match.field === "speaker" ? ".speaker-input" : ".body-input");
     input?.focus();
     const queryLength = String(els.searchInput.value || "").length;
@@ -2836,23 +3085,135 @@
     const data = JSON.stringify(projectForSave(), null, 2);
     const fileName = `${safeFileName(project.title)}.json`;
     if (window.showSaveFilePicker) {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: fileName,
-        types: [
-          {
-            description: "JSONファイル",
-            accept: { "application/json": [".json"] },
-          },
-        ],
-      });
+      const handle = await showJsonSaveFilePicker(fileName);
       const writable = await handle.createWritable();
       await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
       await writable.close();
+      await rememberJsonSaveHandle(handle);
       setSaveState(`JSON保存済み: ${handle.name}`);
       return;
     }
     downloadBlob(data, fileName, "application/json");
     setSaveState("JSON保存済み");
+  }
+
+  async function showJsonSaveFilePicker(fileName) {
+    const rememberedHandle = await getRememberedJsonSaveHandle();
+    const options = {
+      id: JSON_SAVE_PICKER_ID,
+      suggestedName: fileName,
+      types: [
+        {
+          description: "JSONファイル",
+          accept: { "application/json": [".json"] },
+        },
+      ],
+    };
+    if (rememberedHandle) options.startIn = rememberedHandle;
+
+    try {
+      return await window.showSaveFilePicker(options);
+    } catch (error) {
+      if (!rememberedHandle || error?.name === "AbortError") throw error;
+      await forgetRememberedJsonSaveHandle();
+      delete options.startIn;
+      return window.showSaveFilePicker(options);
+    }
+  }
+
+  async function getRememberedJsonSaveHandle() {
+    if (lastJsonSaveHandleLoaded) return lastJsonSaveHandle;
+    lastJsonSaveHandleLoaded = true;
+    try {
+      lastJsonSaveHandle = await readFileHandle(JSON_SAVE_HANDLE_KEY);
+    } catch (error) {
+      console.warn("前回のJSON保存先を読み込めませんでした。", error);
+    }
+    return lastJsonSaveHandle;
+  }
+
+  async function rememberJsonSaveHandle(handle) {
+    lastJsonSaveHandle = handle;
+    lastJsonSaveHandleLoaded = true;
+    try {
+      await writeFileHandle(JSON_SAVE_HANDLE_KEY, handle);
+    } catch (error) {
+      console.warn("JSON保存先を永続化できませんでした。", error);
+    }
+  }
+
+  async function forgetRememberedJsonSaveHandle() {
+    lastJsonSaveHandle = null;
+    lastJsonSaveHandleLoaded = true;
+    try {
+      await deleteFileHandle(JSON_SAVE_HANDLE_KEY);
+    } catch (error) {
+      console.warn("古いJSON保存先を削除できませんでした。", error);
+    }
+  }
+
+  function openFileHandleDatabase() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) {
+        resolve(null);
+        return;
+      }
+      const request = window.indexedDB.open(FILE_HANDLE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(FILE_HANDLE_STORE_NAME)) {
+          database.createObjectStore(FILE_HANDLE_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function readFileHandle(key) {
+    const database = await openFileHandleDatabase();
+    if (!database) return null;
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = database.transaction(FILE_HANDLE_STORE_NAME, "readonly").objectStore(FILE_HANDLE_STORE_NAME).get(key);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+      });
+    } finally {
+      database.close();
+    }
+  }
+
+  async function writeFileHandle(key, handle) {
+    const database = await openFileHandleDatabase();
+    if (!database) return;
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(FILE_HANDLE_STORE_NAME, "readwrite");
+        transaction.objectStore(FILE_HANDLE_STORE_NAME).put(handle, key);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  }
+
+  async function deleteFileHandle(key) {
+    const database = await openFileHandleDatabase();
+    if (!database) return;
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(FILE_HANDLE_STORE_NAME, "readwrite");
+        transaction.objectStore(FILE_HANDLE_STORE_NAME).delete(key);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
   }
 
   function loadJsonFile(event) {
@@ -2920,6 +3281,41 @@
       buildGoogleDocsPastePlainText(),
       "リッチ形式でコピーしました。Googleドキュメントに貼り付けできます。"
     );
+  }
+
+  async function copySpeakersOnlyGoogleDocsRichText() {
+    const targetSections = allSectionsVisible ? project.sections : [getActiveSection()];
+    const speakerNames = targetSections.flatMap((section) => {
+      return section.lines.map((line) => cleanSpeakerName(line.speaker)).filter(Boolean);
+    });
+    if (!speakerNames.length) {
+      setGoogleDocsCopyStatus("表示中のセクションにコピーできる話者がありません。");
+      return;
+    }
+    const targetLabel = allSectionsVisible ? "全セクション" : `「${getActiveSection().title}」`;
+    await copyGoogleDocsRichTextPayload(
+      buildSpeakersOnlyGoogleDocsHtmlDocument(speakerNames),
+      speakerNames.join("\n"),
+      `${targetLabel}の話者${speakerNames.length}件を順番どおりにコピーしました。`
+    );
+  }
+
+  async function copyCurrentSectionGoogleDocsRichText() {
+    if (allSectionsVisible) return;
+    const section = getActiveSection();
+    await copyGoogleDocsRichTextPayload(
+      buildGoogleDocsPasteHtmlDocumentForSections([section]),
+      buildGoogleDocsPastePlainTextForSections([section]),
+      `「${section.title}」をリッチコピーしました。`
+    );
+  }
+
+  function updateCurrentSectionGoogleDocsButton() {
+    if (!els.copyCurrentSectionGoogleDocsButton) return;
+    els.copyCurrentSectionGoogleDocsButton.disabled = allSectionsVisible;
+    els.copyCurrentSectionGoogleDocsButton.title = allSectionsVisible
+      ? "個別セクションを選んでからコピーしてください"
+      : `「${getActiveSection().title}」だけをコピー`;
   }
 
   async function copySelectedGoogleDocsRichText() {
@@ -2995,7 +3391,7 @@
       document.getElementById("googleDocsCopyBuffer")?.remove();
       setGoogleDocsCopyStatus(
         copied
-          ? "リッチ形式でコピーしました。Googleドキュメントに貼り付けできます。"
+          ? successMessage
           : "自動コピーできませんでした。ブラウザのクリップボード権限を確認してください。"
       );
     }
@@ -3013,12 +3409,44 @@
 </html>`;
   }
 
+  function buildSpeakersOnlyGoogleDocsHtmlDocument(speakerNames) {
+    const paragraphs = speakerNames.map((speakerName) => {
+      const color = `#${normalizeDocxColor(project.speakers[speakerName]?.color || autoColor(speakerName))}`;
+      return `<p style="${pasteParagraphStyle()}"><strong style="color:${color}; font-weight:700;">${escapeHtml(speakerName)}</strong></p>`;
+    });
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+  </head>
+  <body>
+    ${paragraphs.join("\n")}
+  </body>
+</html>`;
+  }
+
+  function buildGoogleDocsPasteHtmlDocumentForSections(sections) {
+    return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+  </head>
+  <body>
+    ${buildGoogleDocsSectionsHtml(sections)}
+  </body>
+</html>`;
+  }
+
   function buildGoogleDocsPasteHtmlBody(lines = null) {
     if (isSectionGroupArray(lines)) return buildGoogleDocsSectionGroupsHtml(lines);
     if (Array.isArray(lines)) return buildGoogleDocsLinesHtml(lines);
+    return buildGoogleDocsSectionsHtml(project.sections);
+  }
+
+  function buildGoogleDocsSectionsHtml(sections) {
     const includeSectionTitles = project.sections.length > 1;
     const blocks = [];
-    project.sections.forEach((section, sectionIndex) => {
+    sections.forEach((section, sectionIndex) => {
       if (includeSectionTitles) {
         if (sectionIndex > 0) blocks.push(sectionSeparatorPasteHtml());
         blocks.push(sectionTitlePasteHtml(section.title));
@@ -3089,9 +3517,13 @@
       const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
       return lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body)).join(lineSeparator);
     }
+    return buildGoogleDocsPastePlainTextForSections(project.sections);
+  }
+
+  function buildGoogleDocsPastePlainTextForSections(sections) {
     const includeSectionTitles = project.sections.length > 1;
     const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
-    const sectionTexts = project.sections.map((section) => {
+    const sectionTexts = sections.map((section) => {
       const lines = section.lines.flatMap((line, lineIndex) => {
         const parts = shouldExportNotes()
           ? notesStartingAtLine(section, lineIndex).map(({ note, bounds }) => formatNotePlainText(note, bounds))
