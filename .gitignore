@@ -30,3 +30,7 @@ node_modules/
 dist/
 build/
 coverage/
+
+# Python browser verification artifacts
+__pycache__/
+*.pyc

@@ -4,14 +4,14 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>台本制作エディタ</title>
-    <link rel="stylesheet" href="styles.css?v=20260702-range-notes1">
+    <link rel="stylesheet" href="styles.css?v=20261023-speaker-count-single-line">
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
         <div class="project-block">
           <input id="projectTitle" class="project-title" type="text" placeholder="台本タイトル" aria-label="台本タイトル">
-          <div class="save-state" id="saveState">LocalStorageに自動保存済み</div>
+          <input id="sectionSearch" class="section-search" type="search" placeholder="セクション検索" aria-label="セクション検索" aria-controls="sectionTabs" autocomplete="off">
         </div>
         <div class="toolbar" aria-label="ファイル操作">
           <div class="view-toggles" aria-label="サイドバー表示">
@@ -23,13 +23,14 @@
             </button>
           </div>
           <button id="newProjectButton" type="button">新規</button>
-          <button id="saveJsonButton" type="button" title="JSONを保存し、以後の自動保存先に設定">JSON保存</button>
-          <label class="file-button">
-            JSON読込
-            <input id="loadJsonInput" type="file" accept="application/json,.json">
-          </label>
+          <button id="saveJsonButton" type="button" title="現在のJSONへ保存。未設定の場合は新規ファイルを作成">JSON保存</button>
+          <button id="saveJsonAsButton" type="button" title="既存ファイルを上書きせず、新しいJSONとして保存">別名保存</button>
+          <button id="backupSettingsButton" type="button" title="10分ごとの世代バックアップ先を設定">バックアップ設定</button>
+          <button id="loadJsonButton" type="button">JSON読込</button>
+          <input id="loadJsonInput" type="file" accept="application/json,.json" hidden>
           <button id="exportTxtButton" type="button">TXT書出し</button>
           <button id="exportDocxButton" type="button">DOCX書出し</button>
+          <button id="connectAiButton" type="button" aria-haspopup="dialog" aria-controls="aiConnectionDialog" aria-expanded="false">AI接続</button>
         </div>
       </header>
 
@@ -88,6 +89,21 @@
         </section>
 
         <aside class="settings-pane side-pane" aria-label="設定">
+          <section class="panel furigana-panel">
+            <h2>ふりがな</h2>
+            <label class="option-row furigana-visibility-option">
+              <input id="furiganaVisibleInput" type="checkbox" checked>
+              <span>本文・書出し・コピーに表示</span>
+            </label>
+            <form id="furiganaForm" class="furigana-form">
+              <input id="furiganaWordInput" type="text" placeholder="単語（例：織田信長）" aria-label="ふりがなを付ける単語">
+              <input id="furiganaReadingInput" type="text" placeholder="ふりがな（例：おだ のぶなが）" aria-label="ふりがな">
+              <button type="submit">登録</button>
+            </form>
+            <div id="furiganaList" class="furigana-list"></div>
+            <div id="furiganaStatus" class="status-line" aria-live="polite"></div>
+          </section>
+
           <section class="panel">
             <h2>検索・置換</h2>
             <div class="field-stack">
@@ -164,6 +180,27 @@
       </main>
     </div>
 
-    <script src="app.js?v=20260726-search-enter"></script>
+    <div class="status-notifications" aria-label="保存の通知">
+      <div class="status-notice" id="saveState" role="status" hidden></div>
+      <div class="status-notice" id="backupState" role="status" hidden></div>
+    </div>
+
+    <dialog id="aiConnectionDialog" class="ai-connection-dialog" aria-labelledby="aiConnectionTitle">
+      <h2 id="aiConnectionTitle">AIから台本を編集</h2>
+      <p>接続すると、CodexやGPT Workからこの画面の台本を読み取り・編集できます。AIの変更は保存され、Undoで取り消せます。</p>
+      <p>最初の接続は最大20秒待って再試行します。接続後に通信が途切れても、自動で復帰します。台本のタブが休止した場合は、タブを表示すると復帰します。</p>
+      <label for="aiServerUrl">接続先</label>
+      <input id="aiServerUrl" type="url" value="http://127.0.0.1:39041" spellcheck="false" autocomplete="off">
+      <p id="aiConnectionStatus" role="status" aria-live="polite">未接続</p>
+      <div class="ai-connection-actions">
+        <button id="aiConnectConfirm" type="button">接続</button>
+        <button id="aiDisconnectButton" type="button" disabled>接続を解除</button>
+        <button id="aiConnectionClose" type="button">閉じる</button>
+      </div>
+    </dialog>
+
+    <script src="mcp/project-edits.js?v=20261104-furigana"></script>
+    <script src="app.js?v=20261104-furigana"></script>
+    <script src="mcp/browser-bridge.js?v=20261020-ai-idle-2"></script>
   </body>
 </html>

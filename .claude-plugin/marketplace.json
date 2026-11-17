@@ -1,0 +1,20 @@
+{
+  "name": "script-editor-local",
+  "interface": {
+    "displayName": "台本エディタ"
+  },
+  "plugins": [
+    {
+      "name": "script-editor",
+      "source": {
+        "source": "local",
+        "path": "./mcp/plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

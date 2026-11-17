@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "script_editor_work": {
+      "command": "node",
+      "args": ["F:/NewPC/ProgramFile/台本エディタ/mcp/stdio.mjs"],
+      "cwd": "F:/NewPC/ProgramFile/台本エディタ",
+      "startup_timeout_sec": 20
+    }
+  }
+}

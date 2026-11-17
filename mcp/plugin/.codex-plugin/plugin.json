@@ -1,0 +1,16 @@
+{
+  "name": "script-editor",
+  "version": "1.0.0",
+  "description": "開いている台本エディタの台本を読み取り、検索、編集します。",
+  "author": {
+    "name": "台本エディタ"
+  },
+  "mcpServers": "./.mcp.json",
+  "requires_local_executor": true,
+  "interface": {
+    "displayName": "台本エディタ",
+    "shortDescription": "接続中の台本の読み取り・検索・編集",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"]
+  }
+}

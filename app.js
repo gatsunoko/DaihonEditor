@@ -3,14 +3,20 @@
 
   const STORAGE_KEY = "script-editor-project-v1";
   const UI_STORAGE_KEY = "script-editor-ui-v1";
-  const JSON_SAVE_PICKER_ID = "script-editor-json-save";
+  const JSON_SAVE_DIRECTORY_PICKER_ID = "script-json-save-dir";
   const FILE_HANDLE_DB_NAME = "script-editor-file-handles-v1";
   const FILE_HANDLE_STORE_NAME = "handles";
   const JSON_SAVE_HANDLE_KEY = "last-json-save-file";
+  const BACKUP_DIRECTORY_HANDLE_KEY = "json-backup-directory";
   const JSON_AUTO_SAVE_DELAY = 2000;
+  const STATUS_NOTICE_DURATION = 6000;
+  const BACKUP_INTERVAL = 10 * 60 * 1000;
+  const BACKUP_MAX_FILES = 30;
+  const BACKUP_LAST_SAVED_KEY_PREFIX = "script-editor-last-backup-v1:";
   const SPEAKER_DRAG_TYPE = "application/x-script-speaker-name";
   const NOTE_END_DRAG_TYPE = "application/x-script-note-end";
   const MAX_LINE_DELETE_UNDO = 30;
+  const BODY_EDIT_UNDO_GROUP_DELAY = 1000;
   const DEFAULT_NOTE_KIND = "note";
   const DEFAULT_NOTE_COLOR = "#dbeafe";
   const TYPE_LABELS = {
@@ -41,6 +47,7 @@
   ]);
 
   const els = {};
+  const statusNoticeTimers = new WeakMap();
   let project = createDefaultProject();
   let activeSectionId = project.sections[0].id;
   let allSectionsVisible = false;
@@ -53,6 +60,8 @@
   let lineSelectionAnchorId = "";
   let lineClipboard = [];
   let lineDeleteUndoStack = [];
+  let bodyEditUndoGroup = null;
+  const editedSpeakerInputs = new WeakSet();
   let focusedLineId = "";
   let noteEndDrag = null;
   let bodySelection = null;
@@ -68,11 +77,23 @@
   let renderTimer = 0;
   let compactSidebarQuery = null;
   let narrowSidebarQuery = null;
+  let topbarResizeObserver = null;
   let speakerDrawerOpen = false;
   let settingsDrawerOpen = false;
   let lastJsonSaveHandle = null;
   let lastJsonSaveHandleLoaded = false;
   let lastJsonSaveHandleLoadPromise = null;
+  let backupDirectoryHandle = null;
+  let backupDirectoryHandleLoaded = false;
+  let backupDirectoryHandleLoadPromise = null;
+  let backupTimer = 0;
+  let backupWriteChain = Promise.resolve();
+  let loadedJsonSourceFingerprint = "";
+  let loadedJsonSourceFileIdentity = null;
+  let mcpCompositionActive = false;
+  let mcpRevisionCounter = 0;
+  let mcpLastFingerprint = "";
+  const mcpRevisionPrefix = makeId("revision");
   let uiState = {
     speakerPaneVisible: true,
     settingsPaneVisible: true,
@@ -90,12 +111,93 @@
     normalizeProject();
     renderAll();
     updateBodyColorButton();
-    setSaveState("LocalStorageに自動保存済み");
+    setSaveState("LocalStorageに自動保存済み", { notify: false });
     showRememberedJsonAutoSaveState();
+    showRememberedBackupState();
+    initializeMcpEditing();
+  }
+
+  function initializeMcpEditing() {
+    document.addEventListener("compositionstart", () => { mcpCompositionActive = true; }, true);
+    document.addEventListener("compositionend", () => { mcpCompositionActive = false; }, true);
+    window.scriptEditorMcp = Object.freeze({
+      getSnapshot: getMcpSnapshot,
+      applyEdits: applyMcpEdits,
+    });
+  }
+
+  function mcpError(code, message) {
+    return Object.assign(new Error(message), { code });
+  }
+
+  function getMcpSnapshot() {
+    if (mcpCompositionActive) throw mcpError("BUSY", "文字入力の変換中です。確定してから再実行してください。");
+    const snapshot = JSON.parse(JSON.stringify(projectForSave()));
+    // Saving timestamps and the selected tab do not change the script content.
+    const fingerprint = JSON.stringify(snapshot, (key, value) =>
+      key === "updatedAt" || key === "activeSectionId" ? undefined : value);
+    if (fingerprint !== mcpLastFingerprint) {
+      mcpLastFingerprint = fingerprint;
+      mcpRevisionCounter += 1;
+    }
+    return { project: snapshot, revision: `${mcpRevisionPrefix}:${mcpRevisionCounter}` };
+  }
+
+  function applyMcpEdits(args) {
+    const current = getMcpSnapshot();
+    if (args?.projectId !== current.project.projectId) {
+      throw mcpError("PROJECT_CHANGED", "別の台本に切り替わっています。台本を再取得してください。");
+    }
+    if (args.expectedRevision !== current.revision) {
+      throw mcpError("REVISION_CONFLICT", "台本が編集されています。最新版を読み直して変更を見直してください。");
+    }
+    if (!window.ScriptEditorProjectEdits) throw mcpError("EDITOR_ERROR", "AI編集機能を読み込めませんでした。画面を再読み込みしてください。");
+    // Validate the entire batch on a copy before committing any browser state.
+    const candidate = window.ScriptEditorProjectEdits.applyProjectEdits(projectForSave(), args.operations);
+    const activeElement = document.activeElement;
+    if (activeElement && (activeElement.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(activeElement.tagName))) {
+      activeElement.blur();
+    }
+    // Speaker and note blur handlers can commit additional local changes.
+    if (getMcpSnapshot().revision !== args.expectedRevision) {
+      throw mcpError("REVISION_CONFLICT", "入力が確定され台本が更新されました。最新版を再取得してください。");
+    }
+    const before = cloneProjectForUndo();
+    const previousProject = project;
+    const previousActiveSectionId = activeSectionId;
+    project = candidate;
+    try {
+      normalizeProject();
+      const after = getMcpSnapshot();
+      if (after.revision === current.revision) {
+        project = previousProject;
+        activeSectionId = previousActiveSectionId;
+        return { ...getMcpSnapshot(), changed: false };
+      }
+      // Persist before acknowledging success. JSON autosave retains its ID checks.
+      saveProjectNow();
+    } catch (error) {
+      project = previousProject;
+      activeSectionId = previousActiveSectionId;
+      normalizeProject();
+      renderAll();
+      const code = typeof error.code === "string" ? error.code : "SAVE_FAILED";
+      throw mcpError(code, code === "SAVE_FAILED" ? "変更を保存できなかったため反映を中止しました。保存領域を確認してください。" : error.message);
+    }
+    pushUndoEntry({ type: "mcp-edit", project: before, activeSectionId: previousActiveSectionId, allSectionsVisible, activeSpeakerFilter });
+    clearLineSelectionState();
+    bodySelection = null;
+    bodySelectionRange = null;
+    hideSpeakerPicker();
+    renderAll();
+    setSaveState("AIの変更を保存しました（Undoで取り消せます）", { preserveWarning: true });
+    return { ...getMcpSnapshot(), changed: true, savedTo: "localStorage", jsonAutoSave: "scheduled" };
   }
 
   function cacheElements() {
+    els.topbar = document.querySelector(".topbar");
     els.projectTitle = document.getElementById("projectTitle");
+    els.sectionSearch = document.getElementById("sectionSearch");
     els.saveState = document.getElementById("saveState");
     els.sectionTabs = document.getElementById("sectionTabs");
     els.addSectionButton = document.getElementById("addSectionButton");
@@ -117,6 +219,10 @@
     els.toggleSettingsPaneButton = document.getElementById("toggleSettingsPaneButton");
     els.newProjectButton = document.getElementById("newProjectButton");
     els.saveJsonButton = document.getElementById("saveJsonButton");
+    els.saveJsonAsButton = document.getElementById("saveJsonAsButton");
+    els.backupSettingsButton = document.getElementById("backupSettingsButton");
+    els.backupState = document.getElementById("backupState");
+    els.loadJsonButton = document.getElementById("loadJsonButton");
     els.loadJsonInput = document.getElementById("loadJsonInput");
     els.exportTxtButton = document.getElementById("exportTxtButton");
     els.exportDocxButton = document.getElementById("exportDocxButton");
@@ -136,6 +242,12 @@
     els.speakerBodyColorInput = document.getElementById("speakerBodyColorInput");
     els.speakerFilterSelect = document.getElementById("speakerFilterSelect");
     els.speakerList = document.getElementById("speakerList");
+    els.furiganaVisibleInput = document.getElementById("furiganaVisibleInput");
+    els.furiganaForm = document.getElementById("furiganaForm");
+    els.furiganaWordInput = document.getElementById("furiganaWordInput");
+    els.furiganaReadingInput = document.getElementById("furiganaReadingInput");
+    els.furiganaList = document.getElementById("furiganaList");
+    els.furiganaStatus = document.getElementById("furiganaStatus");
     els.exportBlankLineInput = document.getElementById("exportBlankLineInput");
     els.exportNotesInput = document.getElementById("exportNotesInput");
     els.exportNoteSeparatorInput = document.getElementById("exportNoteSeparatorInput");
@@ -163,15 +275,6 @@
         speakerDrawerOpen = false;
         applySidebarVisibility();
       }
-      if (
-        settingsDrawerOpen &&
-        isCompactSidebarMode() &&
-        !els.settingsPane.contains(event.target) &&
-        !els.toggleSettingsPaneButton.contains(event.target)
-      ) {
-        settingsDrawerOpen = false;
-        applySidebarVisibility();
-      }
       if (!speakerPicker) return;
       if (speakerPicker.element.contains(event.target) || speakerPicker.input === event.target) return;
       hideSpeakerPicker();
@@ -182,17 +285,28 @@
         speakerDrawerOpen = false;
         applySidebarVisibility();
       }
-      if (event.key === "Escape" && settingsDrawerOpen && isCompactSidebarMode()) {
-        settingsDrawerOpen = false;
-        applySidebarVisibility();
-      }
-      if (isUndoShortcut(event) && lineDeleteUndoStack.length && !isEditableTarget(event.target)) {
+      if (
+        !event.defaultPrevented &&
+        !event.isComposing &&
+        event.keyCode !== 229 &&
+        isUndoShortcut(event) &&
+        lineDeleteUndoStack.length &&
+        (!isEditableTarget(event.target) || canUndoFromScriptEditor(event.target)) &&
+        canUndoLastAction()
+      ) {
         event.preventDefault();
         undoLastAction();
       }
     });
     document.addEventListener("selectionchange", updateBodySelectionFromDocument);
-    window.addEventListener("resize", hideSpeakerPicker);
+    window.addEventListener("resize", () => {
+      hideSpeakerPicker();
+      syncStickySidebarTop();
+    });
+    if (window.ResizeObserver && els.topbar) {
+      topbarResizeObserver = new ResizeObserver(syncStickySidebarTop);
+      topbarResizeObserver.observe(els.topbar);
+    }
     window.addEventListener("scroll", handleSpeakerPickerScroll, true);
     window.addEventListener("beforeunload", flushPendingSave);
     document.addEventListener("visibilitychange", () => {
@@ -205,6 +319,14 @@
       markSavePending();
     });
     els.projectTitle.addEventListener("blur", flushPendingSave);
+    els.sectionSearch.addEventListener("input", () => {
+      renderTabs();
+      els.sectionTabs.scrollLeft = 0;
+      renderRows();
+      renderSpeakers();
+      renderStats();
+      updateMatches();
+    });
 
     els.addSectionButton.addEventListener("mousedown", (event) => event.preventDefault());
     els.addSectionButton.addEventListener("click", addSection);
@@ -255,10 +377,15 @@
       applyBodyMark({ color: "" });
       flushPendingSave();
     });
-    els.newProjectButton.addEventListener("click", () => {
-      if (!confirm("現在の内容を破棄して新規作成しますか？")) return;
+    els.newProjectButton.addEventListener("click", async () => {
+      if (!confirm("現在の台本を閉じて新規作成しますか？")) return;
+      if (!(await saveCurrentProjectBeforeSwitch())) return;
+      clearTimeout(backupTimer);
+      backupTimer = 0;
       forgetRememberedJsonSaveHandle();
       project = createDefaultProject();
+      loadedJsonSourceFingerprint = "";
+      loadedJsonSourceFileIdentity = null;
       activeSectionId = project.sections[0].id;
       allSectionsVisible = false;
       activeSpeakerFilter = "";
@@ -273,7 +400,28 @@
       saveJson().catch((error) => {
         if (error?.name === "AbortError") return;
         console.error(error);
-        alert("JSONを保存できませんでした。");
+        alert(`JSONを保存できませんでした。\n\n${fileOperationErrorDetail(error)}`);
+      });
+    });
+    els.saveJsonAsButton.addEventListener("click", () => {
+      saveJsonAs().catch((error) => {
+        if (error?.name === "AbortError") return;
+        console.error(error);
+        alert(`JSONを別名保存できませんでした。\n\n${fileOperationErrorDetail(error)}`);
+      });
+    });
+    els.backupSettingsButton.addEventListener("click", () => {
+      chooseBackupDirectory().catch((error) => {
+        if (error?.name === "AbortError") return;
+        console.error(error);
+        alert("バックアップフォルダを設定できませんでした。");
+      });
+    });
+    els.loadJsonButton.addEventListener("click", () => {
+      chooseJsonFileToLoad().catch((error) => {
+        if (error?.name === "AbortError") return;
+        console.error(error);
+        alert("JSONを読み込めませんでした。");
       });
     });
     els.loadJsonInput.addEventListener("change", loadJsonFile);
@@ -293,6 +441,17 @@
       project.settings.exportNoteSeparators = els.exportNoteSeparatorInput.checked;
       renderGoogleDocsPreview();
       scheduleSave();
+    });
+    els.furiganaVisibleInput.addEventListener("change", () => {
+      project.settings.showFurigana = els.furiganaVisibleInput.checked;
+      renderRows();
+      renderGoogleDocsPreview();
+      setFuriganaStatus(project.settings.showFurigana ? "ふりがなを表示します。" : "ふりがなを非表示にしました。");
+      scheduleSave();
+    });
+    els.furiganaForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      registerFuriganaEntry();
     });
     els.copyGoogleDocsButton.addEventListener("click", copyGoogleDocsRichText);
     els.copySpeakersOnlyGoogleDocsButton.addEventListener("click", copySpeakersOnlyGoogleDocsRichText);
@@ -344,6 +503,7 @@
   function createDefaultProject() {
     const sectionId = makeId("section");
     return {
+      projectId: createProjectId(),
       title: "無題の台本",
       activeSectionId: sectionId,
       sections: [
@@ -356,10 +516,12 @@
       ],
       speakers: {},
       speakerOrder: [],
+      furigana: [],
       settings: {
         exportBlankLineBetweenLines: false,
         exportNotes: false,
         exportNoteSeparators: false,
+        showFurigana: true,
       },
       updatedAt: new Date().toISOString(),
     };
@@ -413,12 +575,12 @@
   }
 
   function handleCompactSidebarChange() {
-    settingsDrawerOpen = false;
     speakerDrawerOpen = false;
     applySidebarVisibility();
   }
 
   function applySidebarVisibility() {
+    syncStickySidebarTop();
     const compactMode = isCompactSidebarMode();
     const speakerDrawerMode = isNarrowSpeakerDrawerMode();
     document.body.classList.toggle("sidebar-left-hidden", !speakerDrawerMode && !uiState.speakerPaneVisible);
@@ -429,6 +591,14 @@
     document.body.classList.toggle("settings-drawer-open", compactMode && settingsDrawerOpen);
     updateSidebarToggleButton(els.toggleSpeakerPaneButton, speakerDrawerMode ? speakerDrawerOpen : uiState.speakerPaneVisible, "話者");
     updateSidebarToggleButton(els.toggleSettingsPaneButton, compactMode ? settingsDrawerOpen : uiState.settingsPaneVisible, "設定");
+  }
+
+  function syncStickySidebarTop() {
+    if (!els.topbar) return;
+    const rootStyles = getComputedStyle(document.documentElement);
+    const pagePadding = Number.parseFloat(rootStyles.getPropertyValue("--page-padding")) || 0;
+    const topbarBottom = els.topbar.getBoundingClientRect().bottom;
+    document.documentElement.style.setProperty("--sticky-sidebar-top", `${Math.ceil(topbarBottom + pagePadding)}px`);
   }
 
   function updateSidebarToggleButton(button, visible, label) {
@@ -443,6 +613,7 @@
     const fallback = createDefaultProject();
     if (!raw || !Array.isArray(raw.sections)) return fallback;
     return {
+      projectId: typeof raw.projectId === "string" && raw.projectId.trim() ? raw.projectId : fallback.projectId,
       title: typeof raw.title === "string" ? raw.title : fallback.title,
       activeSectionId: typeof raw.activeSectionId === "string" ? raw.activeSectionId : raw.sections[0]?.id,
       sections: raw.sections.length
@@ -450,12 +621,14 @@
         : fallback.sections,
       speakers: raw.speakers && typeof raw.speakers === "object" ? raw.speakers : {},
       speakerOrder: Array.isArray(raw.speakerOrder) ? raw.speakerOrder.filter((name) => typeof name === "string") : [],
+      furigana: normalizeFuriganaEntries(raw.furigana),
       settings: {
         ...fallback.settings,
         ...(raw.settings && typeof raw.settings === "object" ? raw.settings : {}),
         exportBlankLineBetweenLines: Boolean(raw.settings?.exportBlankLineBetweenLines),
         exportNotes: Boolean(raw.settings?.exportNotes),
         exportNoteSeparators: Boolean(raw.settings?.exportNoteSeparators),
+        showFurigana: raw.settings?.showFurigana !== false,
       },
       updatedAt: raw.updatedAt || new Date().toISOString(),
     };
@@ -509,6 +682,8 @@
     project.settings.exportBlankLineBetweenLines = Boolean(project.settings.exportBlankLineBetweenLines);
     project.settings.exportNotes = Boolean(project.settings.exportNotes);
     project.settings.exportNoteSeparators = Boolean(project.settings.exportNoteSeparators);
+    project.settings.showFurigana = project.settings.showFurigana !== false;
+    project.furigana = normalizeFuriganaEntries(project.furigana);
     project.activeSectionId = activeSectionId;
     project.sections.forEach((section) => {
       if (!section.lines.length) section.lines.push(createLine());
@@ -558,6 +733,7 @@
     renderTabs();
     renderRows();
     renderSpeakers();
+    renderFuriganaSettings();
     renderStats();
     renderExportSettings();
     renderGoogleDocsPreview();
@@ -571,6 +747,11 @@
     els.exportBlankLineInput.checked = Boolean(project.settings?.exportBlankLineBetweenLines);
     els.exportNotesInput.checked = Boolean(project.settings?.exportNotes);
     els.exportNoteSeparatorInput.checked = Boolean(project.settings?.exportNoteSeparators);
+  }
+
+  function renderFuriganaSettings() {
+    els.furiganaVisibleInput.checked = isFuriganaVisible();
+    renderFuriganaList();
   }
 
   function updateFooterActionAvailability() {
@@ -588,6 +769,19 @@
   function renderGoogleDocsPreview() {
     if (!els.googleDocsPreview) return;
     els.googleDocsPreview.innerHTML = buildGoogleDocsPasteHtmlBody();
+  }
+
+  function normalizeSectionSearch(value) {
+    return String(value || "").normalize("NFKC").toLowerCase().trim();
+  }
+
+  function sectionMatchesSearch(section) {
+    return normalizeSectionSearch(section.title).includes(normalizeSectionSearch(els.sectionSearch.value));
+  }
+
+  function getDisplayedSections() {
+    const sections = allSectionsVisible ? project.sections : [getActiveSection()];
+    return sections.filter(sectionMatchesSearch);
   }
 
   function renderTabs() {
@@ -609,6 +803,7 @@
     els.sectionTabs.appendChild(allItem);
 
     project.sections.forEach((section, index) => {
+      if (!sectionMatchesSearch(section)) return;
       const isActive = !allSectionsVisible && section.id === activeSectionId;
       const item = document.createElement("div");
       item.className = `tab-item${isActive ? " active" : ""}`;
@@ -616,6 +811,7 @@
       const tab = document.createElement("button");
       tab.className = "tab";
       tab.type = "button";
+      tab.title = section.title;
       tab.setAttribute("role", "tab");
       tab.setAttribute("aria-selected", String(isActive));
 
@@ -667,8 +863,9 @@
   }
 
   function renderRows() {
+    bodyEditUndoGroup = null;
     hideSpeakerPicker();
-    const sectionsToRender = allSectionsVisible ? project.sections : [getActiveSection()];
+    const sectionsToRender = getDisplayedSections();
     const speakerFilter = getActiveSpeakerFilter();
     let visibleCount = 0;
     els.scriptRows.innerHTML = "";
@@ -702,7 +899,12 @@
 
       const number = document.createElement("div");
       number.className = "line-number";
-      number.textContent = String(index + 1).padStart(3, "0");
+      const displayLineNumber = allSectionsVisible
+        ? visibleCount
+        : speakerFilter
+          ? sectionVisibleCount
+          : index + 1;
+      number.textContent = String(displayLineNumber).padStart(3, "0");
       if (allSectionsVisible) {
         number.draggable = false;
         number.title = "全表示中は行移動と複数選択はできません";
@@ -739,6 +941,8 @@
       speakerInput.value = line.speaker;
       speakerInput.placeholder = line.type === "dialogue" ? "話者名" : TYPE_LABELS[line.type];
       speakerInput.addEventListener("input", () => preserveEditorScroll(() => {
+        editedSpeakerInputs.add(speakerInput);
+        bodyEditUndoGroup = null;
         line.speaker = cleanSpeakerName(speakerInput.value);
         line.speakerCommitted = false;
         line.type = inferType(line.speaker, line.body, line.type);
@@ -754,6 +958,7 @@
         markSavePending();
       }));
       speakerInput.addEventListener("focus", () => {
+        editedSpeakerInputs.delete(speakerInput);
         flushPendingSave();
         focusedLineId = line.id;
         if (!cleanSpeakerName(speakerInput.value)) showSpeakerPicker(speakerInput, line, syncRowVisual);
@@ -790,9 +995,34 @@
       bodyInput.setAttribute("aria-label", "本文");
       bodyInput.dataset.placeholder = "本文";
       bodyInput.innerHTML = bodyEditorHtml(line);
-      bodyInput.addEventListener("input", () => preserveEditorScroll(() => {
+      let beforeInputSelection = null;
+      let bodyComposing = false;
+      let bodyCompositionEnding = false;
+      bodyInput.addEventListener("compositionstart", () => {
+        bodyComposing = true;
+        bodyEditUndoGroup = null;
+      });
+      bodyInput.addEventListener("compositionend", () => {
+        bodyComposing = false;
+        bodyCompositionEnding = true;
+        const compositionEntry = bodyEditUndoGroup?.entry;
+        // 確定入力が compositionend の後に発火しても、同じ履歴にまとめる。
+        setTimeout(() => {
+          bodyCompositionEnding = false;
+          if (bodyEditUndoGroup?.entry === compositionEntry) bodyEditUndoGroup = null;
+        }, 0);
+      });
+      bodyInput.addEventListener("input", (event) => preserveEditorScroll(() => {
+        const previousBody = bodyStateForUndo(line);
         syncBodyEditorToLine(bodyInput, line);
         line.type = inferType(line.speaker, line.body, line.type);
+        recordBodyEditUndo(section.id, line, previousBody, beforeInputSelection, {
+          inputType: event.inputType,
+          composing: bodyComposing || event.isComposing,
+          compositionCommit: bodyCompositionEnding,
+          selection: selectionOffsetsForEditor(bodyInput),
+        });
+        beforeInputSelection = null;
         if (shouldAutoRegisterSpeaker(line)) ensureSpeaker(line.speaker, undefined, true);
         pruneUnusedAutoSpeakers();
         syncRowVisual();
@@ -804,14 +1034,30 @@
         markSavePending();
       }));
       bodyInput.addEventListener("focus", () => {
+        bodyEditUndoGroup = null;
+        bodyInput.querySelectorAll(".furigana-annotation").forEach((annotation) => annotation.remove());
         flushPendingSave();
         focusedLineId = line.id;
         captureBodySelection(line.id, bodyInput);
         resizeBodyInput(bodyInput);
         if (!suppressBodyFocusScroll) centerRowForEditing(row);
       });
-      bodyInput.addEventListener("beforeinput", () => captureBodySelection(line.id, bodyInput));
-      bodyInput.addEventListener("blur", flushPendingSave);
+      bodyInput.addEventListener("beforeinput", (event) => {
+        if (event.inputType === "historyUndo" && !bodyComposing && !event.isComposing &&
+          canUndoFromScriptEditor(bodyInput) && canUndoLastAction()) {
+          event.preventDefault();
+          undoLastAction();
+          return;
+        }
+        captureBodySelection(line.id, bodyInput);
+        beforeInputSelection = selectionOffsetsForEditor(bodyInput);
+      });
+      bodyInput.addEventListener("blur", () => {
+        bodyEditUndoGroup = null;
+        bodyInput.innerHTML = bodyEditorHtml(line);
+        resizeBodyInput(bodyInput);
+        flushPendingSave();
+      });
       bodyInput.addEventListener("mouseup", () => captureBodySelection(line.id, bodyInput));
       bodyInput.addEventListener("keyup", () => preserveEditorScroll(() => {
         captureBodySelection(line.id, bodyInput);
@@ -854,10 +1100,14 @@
       });
       if (heading && speakerFilter && sectionVisibleCount === 0) heading.remove();
     });
-    if (speakerFilter && visibleCount === 0) {
+    if (sectionsToRender.length === 0 || (speakerFilter && visibleCount === 0)) {
       const empty = document.createElement("div");
       empty.className = "speaker-filter-empty";
-      empty.textContent = "表示対象の行はありません。";
+      empty.textContent = sectionsToRender.length === 0
+        ? project.sections.some(sectionMatchesSearch)
+          ? "選択中のセクションは検索条件に一致しません。一覧からセクションを選ぶか、「全て表示」を選んでください。"
+          : "検索条件に一致するセクションはありません。"
+        : "表示対象の行はありません。";
       els.scriptRows.appendChild(empty);
     }
     updateSelectedLineStatus();
@@ -871,6 +1121,7 @@
     const title = document.createElement("span");
     title.className = "all-section-title";
     title.textContent = section.title;
+    title.title = section.title;
     const count = document.createElement("span");
     count.className = "all-section-count";
     count.textContent = `${section.lines.length}行`;
@@ -1223,14 +1474,37 @@
     if (!runs.length) return "";
     const query = searchQueryForField("body");
     const current = currentMatchForLineField(line.id, "body");
+    const furiganaByEnd = new Map(furiganaMatches(line.body).map((match) => [match.end, match.reading]));
     let offset = 0;
     return runs.map((run) => {
       const styles = [];
       if (run.bold) styles.push("font-weight:900");
       if (run.color) styles.push(`color:${run.color}`);
-      const text = highlightSearchText(run.text, query, offset, current?.start ?? -1).replace(/\n/g, "<br>");
-      offset += run.text.length;
-      return styles.length ? `<span style="${styles.join(";")}">${text}</span>` : text;
+      const runStart = offset;
+      const runEnd = runStart + run.text.length;
+      const boundaries = Array.from(furiganaByEnd.keys())
+        .filter((end) => end > runStart && end < runEnd)
+        .sort((a, b) => a - b);
+      const pieces = [];
+      let pieceStart = runStart;
+      [...boundaries, runEnd].forEach((pieceEnd) => {
+        if (pieceEnd > pieceStart) {
+          const text = highlightSearchText(
+            line.body.slice(pieceStart, pieceEnd),
+            query,
+            pieceStart,
+            current?.start ?? -1,
+          ).replace(/\n/g, "<br>");
+          pieces.push(styles.length ? `<span style="${styles.join(";")}">${text}</span>` : text);
+        }
+        const reading = furiganaByEnd.get(pieceEnd);
+        if (reading) {
+          pieces.push(`<span class="furigana-annotation" contenteditable="false" data-furigana="${escapeHtml(reading)}" aria-label="ふりがな ${escapeHtml(reading)}"></span>`);
+        }
+        pieceStart = pieceEnd;
+      });
+      offset = runEnd;
+      return pieces.join("");
     }).join("");
   }
 
@@ -1302,6 +1576,115 @@
       });
     }
     return mergeStyledRuns(runs);
+  }
+
+  function styledTextRunsWithFurigana(text, marks) {
+    const source = String(text || "");
+    const runs = styledTextRuns(source, marks);
+    const matches = furiganaMatches(source);
+    if (!matches.length) return runs;
+    const readingByEnd = new Map(matches.map((match) => [match.end, match.reading]));
+    const result = [];
+    let offset = 0;
+    runs.forEach((run) => {
+      const runStart = offset;
+      const runEnd = runStart + run.text.length;
+      const boundaries = Array.from(readingByEnd.keys())
+        .filter((end) => end > runStart && end <= runEnd)
+        .sort((a, b) => a - b);
+      let pieceStart = runStart;
+      [...boundaries, runEnd].forEach((pieceEnd) => {
+        if (pieceEnd > pieceStart) {
+          result.push({
+            text: source.slice(pieceStart, pieceEnd),
+            bold: run.bold,
+            color: run.color,
+          });
+        }
+        const reading = readingByEnd.get(pieceEnd);
+        if (reading) {
+          result.push({
+            text: `（${reading}）`,
+            bold: run.bold,
+            color: run.color,
+          });
+        }
+        pieceStart = pieceEnd;
+      });
+      offset = runEnd;
+    });
+    return mergeStyledRuns(result);
+  }
+
+  function normalizeFuriganaEntries(entries) {
+    if (!Array.isArray(entries)) return [];
+    const normalized = [];
+    const indexByWord = new Map();
+    entries.forEach((entry) => {
+      const word = cleanFuriganaValue(entry?.word);
+      const reading = cleanFuriganaValue(entry?.reading);
+      if (!word || !reading) return;
+      if (indexByWord.has(word)) {
+        normalized[indexByWord.get(word)].reading = reading;
+        return;
+      }
+      indexByWord.set(word, normalized.length);
+      normalized.push({ word, reading });
+    });
+    return normalized;
+  }
+
+  function cleanFuriganaValue(value) {
+    return String(value || "").replace(/[\r\n]+/g, " ").trim();
+  }
+
+  function isFuriganaVisible() {
+    return project.settings?.showFurigana !== false;
+  }
+
+  function activeFuriganaEntries() {
+    if (!isFuriganaVisible()) return [];
+    return project.furigana
+      .map((entry, index) => ({ ...entry, index }))
+      .sort((a, b) => b.word.length - a.word.length || a.index - b.index);
+  }
+
+  function furiganaMatches(text) {
+    const source = String(text || "");
+    const entries = activeFuriganaEntries();
+    if (!source || !entries.length) return [];
+    const matches = [];
+    let cursor = 0;
+    while (cursor < source.length) {
+      const entry = entries.find((candidate) => source.startsWith(candidate.word, cursor));
+      if (!entry) {
+        cursor += source.codePointAt(cursor) > 0xFFFF ? 2 : 1;
+        continue;
+      }
+      const end = cursor + entry.word.length;
+      const annotation = `（${entry.reading}）`;
+      if (source.startsWith(annotation, end)) {
+        cursor = end + annotation.length;
+        continue;
+      }
+      matches.push({ start: cursor, end, word: entry.word, reading: entry.reading });
+      cursor = end;
+    }
+    return matches;
+  }
+
+  function textWithFurigana(text) {
+    const source = String(text || "");
+    const matches = furiganaMatches(source);
+    if (!matches.length) return source;
+    let result = "";
+    let cursor = 0;
+    matches.forEach((match) => {
+      result += source.slice(cursor, match.end);
+      result += `（${match.reading}）`;
+      cursor = match.end;
+    });
+    return result + source.slice(cursor);
   }
 
   function mergeStyledRuns(runs) {
@@ -1473,6 +1856,14 @@
     return tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT";
   }
 
+  function canUndoFromScriptEditor(target) {
+    const latest = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
+    if (closestBodyEditor(target)) return latest?.type !== "line-add";
+    const speakerInput = target?.closest?.(".speaker-input");
+    return Boolean(speakerInput && !editedSpeakerInputs.has(speakerInput) &&
+      (latest?.type === "body-edit" || latest?.type === "paste"));
+  }
+
   function selectionOffsetsForEditor(editor) {
     const selection = document.getSelection?.();
     if (!selection || !selection.rangeCount) return null;
@@ -1530,7 +1921,10 @@
     const line = findLine(bodySelection.lineId);
     if (!line) return false;
     const selectionToRestore = { ...bodySelection };
+    const previousBody = bodyStateForUndo(line);
     line.bodyMarks = applyMarkToRange(line.bodyMarks, line.body.length, bodySelection.start, bodySelection.end, style);
+    const section = project.sections.find((item) => item.lines.some((itemLine) => itemLine.id === line.id));
+    recordBodyEditUndo(section.id, line, previousBody, selectionToRestore);
     renderAll();
     restoreBodySelectionAfterRender(selectionToRestore);
     markSavePending();
@@ -1696,6 +2090,7 @@
 
   function renderSpeakers() {
     const counts = speakerCounts();
+    const selectedCounts = speakerCounts(getDisplayedSections());
     syncSpeakerOrder();
     const names = orderedSpeakerNames();
     renderSpeakerFilterOptions(names);
@@ -1746,12 +2141,26 @@
 
       const meta = document.createElement("div");
       meta.className = "speaker-meta";
-      const speakerName = document.createElement("div");
+      const speakerName = document.createElement("button");
       speakerName.className = "speaker-name";
-      speakerName.textContent = name;
+      speakerName.type = "button";
+      speakerName.title = "話者名を変更（全セクションに反映）";
+      speakerName.setAttribute("aria-label", `${name}の話者名を変更`);
+      const nameText = document.createElement("span");
+      nameText.className = "speaker-name-text";
+      nameText.textContent = name;
+      const editIcon = document.createElement("span");
+      editIcon.className = "speaker-name-icon";
+      editIcon.setAttribute("aria-hidden", "true");
+      editIcon.textContent = "✎";
+      speakerName.append(nameText, editIcon);
+      speakerName.addEventListener("click", (event) => {
+        event.stopPropagation();
+        renameSpeaker(name);
+      });
       const count = document.createElement("div");
       count.className = "speaker-count";
-      count.textContent = `${counts[name] || 0}行`;
+      count.textContent = `全体 ${counts[name] || 0}行 / 選択 ${selectedCounts[name] || 0}行`;
       meta.append(speakerName, count);
 
       const colorInput = document.createElement("input");
@@ -1793,6 +2202,88 @@
     });
   }
 
+  function registerFuriganaEntry() {
+    const word = cleanFuriganaValue(els.furiganaWordInput.value);
+    const reading = cleanFuriganaValue(els.furiganaReadingInput.value);
+    if (!word || !reading) {
+      setFuriganaStatus("単語とふりがなの両方を入力してください。");
+      (!word ? els.furiganaWordInput : els.furiganaReadingInput).focus();
+      return;
+    }
+    const existing = project.furigana.find((entry) => entry.word === word);
+    if (existing) {
+      existing.reading = reading;
+    } else {
+      project.furigana.push({ word, reading });
+    }
+    els.furiganaWordInput.value = "";
+    els.furiganaReadingInput.value = "";
+    renderFuriganaList();
+    renderRows();
+    renderGoogleDocsPreview();
+    setFuriganaStatus(existing ? `「${word}」のふりがなを更新しました。` : `「${word}」を登録しました。`);
+    scheduleSave();
+    els.furiganaWordInput.focus();
+  }
+
+  function renderFuriganaList() {
+    els.furiganaList.innerHTML = "";
+    if (!project.furigana.length) {
+      const empty = document.createElement("div");
+      empty.className = "furigana-empty";
+      empty.textContent = "登録した単語が本文にあると、自動で（ふりがな）を表示します。";
+      els.furiganaList.appendChild(empty);
+      return;
+    }
+    project.furigana.forEach((entry) => {
+      const item = document.createElement("div");
+      item.className = "furigana-item";
+
+      const pair = document.createElement("div");
+      pair.className = "furigana-pair";
+      const word = document.createElement("strong");
+      word.textContent = entry.word;
+      const reading = document.createElement("span");
+      reading.textContent = `（${entry.reading}）`;
+      pair.append(word, reading);
+
+      const editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.className = "furigana-edit-button";
+      editButton.textContent = "編集";
+      editButton.setAttribute("aria-label", `${entry.word}のふりがなを編集`);
+      editButton.addEventListener("click", () => {
+        els.furiganaWordInput.value = entry.word;
+        els.furiganaReadingInput.value = entry.reading;
+        els.furiganaReadingInput.focus();
+        els.furiganaReadingInput.select();
+        setFuriganaStatus(`「${entry.word}」を編集中です。登録すると上書きします。`);
+      });
+
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "furigana-delete-button";
+      deleteButton.textContent = "×";
+      deleteButton.title = "削除";
+      deleteButton.setAttribute("aria-label", `${entry.word}のふりがなを削除`);
+      deleteButton.addEventListener("click", () => {
+        project.furigana = project.furigana.filter((item) => item.word !== entry.word);
+        renderFuriganaList();
+        renderRows();
+        renderGoogleDocsPreview();
+        setFuriganaStatus(`「${entry.word}」を削除しました。`);
+        scheduleSave();
+      });
+
+      item.append(pair, editButton, deleteButton);
+      els.furiganaList.appendChild(item);
+    });
+  }
+
+  function setFuriganaStatus(text) {
+    if (els.furiganaStatus) els.furiganaStatus.textContent = text;
+  }
+
   function renderSpeakerFilterOptions(names) {
     if (!els.speakerFilterSelect) return;
     const speakerFilter = getActiveSpeakerFilter();
@@ -1816,9 +2307,7 @@
       return sum + countBodyChars(section.lines);
     }, 0);
     const speakerFilter = getActiveSpeakerFilter();
-    const visibleLines = allSectionsVisible
-      ? project.sections.flatMap((section) => section.lines)
-      : getActiveSection().lines;
+    const visibleLines = getDisplayedSections().flatMap((section) => section.lines);
     const activeLines = visibleLines.filter((line) => lineMatchesSpeakerFilter(line, speakerFilter));
     const active = countBodyChars(activeLines);
     els.totalBodyChars.textContent = total.toLocaleString("ja-JP");
@@ -1882,7 +2371,15 @@
   }
 
   function undoTitleForEntry(entry) {
+    if (entry?.type === "mcp-edit") return "AIの変更を元に戻す";
+    if (entry?.type === "body-edit") return "直前の本文編集を元に戻す";
+    if (entry?.type === "speaker-rename") return "直前の話者名変更を元に戻す";
     if (entry?.type === "replace") return "直前の置換を元に戻す";
+    if (entry?.type === "paste") return "直前の貼り付けを元に戻す";
+    if (entry?.type === "line-add") {
+      const count = entry.lineIds?.length || 0;
+      return count > 1 ? `${count}行の追加を元に戻す` : "直前の行追加を元に戻す";
+    }
     const count = entry?.lines?.length || 0;
     return count > 1 ? `${count}行の削除を元に戻す` : "直前の削除を元に戻す";
   }
@@ -1903,23 +2400,129 @@
     });
   }
 
+  function pushPasteUndo(entry) {
+    if (!entry?.project) return;
+    pushUndoEntry({
+      ...entry,
+      type: "paste",
+      afterFingerprint: projectUndoFingerprint(project),
+    });
+  }
+
   function pushUndoEntry(entry) {
+    bodyEditUndoGroup = null;
     lineDeleteUndoStack.push(entry);
     if (lineDeleteUndoStack.length > MAX_LINE_DELETE_UNDO) lineDeleteUndoStack.shift();
     updateLineDeleteUndoButton();
   }
 
   function undoLastAction() {
+    if (!canUndoLastAction()) return false;
+    bodyEditUndoGroup = null;
     const entry = lineDeleteUndoStack.pop();
     if (!entry) {
       updateLineDeleteUndoButton();
-      return;
+      return false;
     }
-    if (entry.type === "replace") {
+    if (entry.type === "body-edit") {
+      undoBodyEdit(entry);
+      return true;
+    }
+    if (entry.type === "replace" || entry.type === "speaker-rename" || entry.type === "mcp-edit") {
       undoReplace(entry);
-      return;
+      return true;
+    }
+    if (entry.type === "paste") {
+      undoPaste(entry);
+      return true;
+    }
+    if (entry.type === "line-add") {
+      undoAddedLines(entry);
+      return true;
     }
     undoDeletedLines(entry);
+    return true;
+  }
+
+  function canUndoLastAction() {
+    const entry = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
+    if (!entry) return false;
+    if (entry.type !== "paste") return true;
+    return entry.afterFingerprint === projectUndoFingerprint(project);
+  }
+
+  function projectUndoFingerprint(value) {
+    return JSON.stringify(value, (key, item) => (key === "updatedAt" ? undefined : item));
+  }
+
+  function bodyStateForUndo(line) {
+    return {
+      body: line.body,
+      bodyMarks: normalizeBodyMarks(line.bodyMarks, line.body.length),
+      type: line.type,
+    };
+  }
+
+  function recordBodyEditUndo(sectionId, line, before, selection, input = {}) {
+    const after = bodyStateForUndo(line);
+    const beforeFingerprint = JSON.stringify(before);
+    const afterFingerprint = JSON.stringify(after);
+    if (beforeFingerprint === afterFingerprint || input.inputType === "historyUndo" || input.inputType === "historyRedo") return;
+
+    const now = Date.now();
+    const group = bodyEditUndoGroup;
+    const latest = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
+    const groupable = input.composing || input.compositionCommit ||
+      ["insertText", "insertCompositionText", "deleteContentBackward", "deleteContentForward"].includes(input.inputType);
+    const continuingComposition = group?.composing && (input.composing || input.compositionCommit);
+    const adjacentSelection = selection && group?.selection &&
+      selection.start === selection.end &&
+      selection.start === group.selection.start && selection.end === group.selection.end;
+    const merge = group && group.entry === latest && group.entry.lineId === line.id &&
+      group.afterFingerprint === beforeFingerprint && groupable &&
+      (continuingComposition || (group.inputType === input.inputType &&
+        !group.composing && adjacentSelection && now - group.time <= BODY_EDIT_UNDO_GROUP_DELAY));
+
+    if (!merge) {
+      pushUndoEntry({
+        type: "body-edit",
+        sectionId,
+        lineId: line.id,
+        before,
+        selection: selection ? { start: selection.start, end: selection.end } : null,
+      });
+    }
+    bodyEditUndoGroup = groupable ? {
+      entry: lineDeleteUndoStack[lineDeleteUndoStack.length - 1],
+      inputType: input.inputType,
+      composing: Boolean(input.composing),
+      afterFingerprint,
+      selection: input.selection,
+      time: now,
+    } : null;
+  }
+
+  function undoBodyEdit(entry) {
+    const section = project.sections.find((item) => item.id === entry.sectionId);
+    const line = section?.lines.find((item) => item.id === entry.lineId);
+    if (!line) {
+      updateLineDeleteUndoButton();
+      return;
+    }
+    line.body = entry.before.body;
+    line.bodyMarks = normalizeBodyMarks(entry.before.bodyMarks, line.body.length);
+    line.type = inferType(line.speaker, line.body, entry.before.type);
+    if (!allSectionsVisible) {
+      activeSectionId = section.id;
+      project.activeSectionId = section.id;
+    }
+    if (!lineMatchesSpeakerFilter(line)) activeSpeakerFilter = "";
+    focusedLineId = line.id;
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+    const selection = entry.selection || { start: line.body.length, end: line.body.length };
+    restoreBodySelectionAfterRender({ lineId: line.id, ...selection });
   }
 
   function undoReplace(entry) {
@@ -1931,6 +2534,73 @@
     normalizeProject();
     renderAll();
     scheduleSave();
+  }
+
+  function undoPaste(entry) {
+    project = hydrateProject(entry.project);
+    activeSectionId = entry.activeSectionId || project.activeSectionId || project.sections[0].id;
+    allSectionsVisible = Boolean(entry.allSectionsVisible);
+    activeSpeakerFilter = entry.activeSpeakerFilter || "";
+    selectedLineIds = new Set(entry.selectedLineIds || []);
+    lineSelectionAnchorId = entry.lineSelectionAnchorId || "";
+    focusedLineId = entry.focusedLineId || entry.focus?.lineId || "";
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+    restorePasteFocus(entry.focus);
+  }
+
+  function restorePasteFocus(focus) {
+    if (!focus?.lineId) return;
+    const line = findLine(focus.lineId);
+    if (!line) return;
+    if (focus.field === "body") {
+      const start = clampNumber(focus.start, 0, line.body.length);
+      const end = clampNumber(focus.end, 0, line.body.length);
+      bodySelection = { lineId: focus.lineId, start, end };
+      restoreBodySelectionAfterRender(bodySelection);
+      return;
+    }
+    requestAnimationFrame(() => {
+      const row = Array.from(els.scriptRows.querySelectorAll(".script-row"))
+        .find((item) => item.dataset.lineId === focus.lineId);
+      const input = row?.querySelector(".speaker-input");
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(
+        clampNumber(focus.start, 0, input.value.length),
+        clampNumber(focus.end, 0, input.value.length),
+      );
+    });
+  }
+
+  function undoAddedLines(entry) {
+    const section = project.sections.find((item) => item.id === entry.sectionId);
+    if (!section) {
+      updateLineDeleteUndoButton();
+      return;
+    }
+    const addedIds = new Set(entry.lineIds || []);
+    if (!addedIds.size) {
+      updateLineDeleteUndoButton();
+      return;
+    }
+    section.lines = section.lines.filter((line) => !addedIds.has(line.id));
+    if (!section.lines.length) section.lines.push(createLine());
+    selectedLineIds = new Set(Array.from(selectedLineIds).filter((lineId) => !addedIds.has(lineId)));
+    if (addedIds.has(lineSelectionAnchorId)) lineSelectionAnchorId = "";
+    activeSectionId = section.id;
+    allSectionsVisible = false;
+    project.activeSectionId = section.id;
+    const focusIndex = section.lines.findIndex((line) => line.id === entry.focusLineId);
+    focusedLineId = focusIndex >= 0 ? entry.focusLineId : section.lines[Math.max(0, entry.index - 1)]?.id || "";
+    normalizeProject();
+    renderAll();
+    scheduleSave();
+    requestAnimationFrame(() => {
+      const restoredFocusIndex = section.lines.findIndex((line) => line.id === focusedLineId);
+      if (restoredFocusIndex >= 0) focusLine(restoredFocusIndex, entry.focusField || "speaker");
+    });
   }
 
   function undoDeletedLines(entry) {
@@ -2384,6 +3054,45 @@
     scheduleSave();
   }
 
+  function renameSpeaker(name) {
+    const speaker = project.speakers[name];
+    if (!speaker) return;
+    const enteredName = prompt("新しい話者名\n全セクションの同じ話者名もまとめて変更します。", name);
+    if (enteredName === null) return;
+    const nextName = cleanSpeakerName(enteredName.trim());
+    if (!nextName) {
+      alert("話者名を入力してください。");
+      return;
+    }
+    if (nextName === name) return;
+    if (Object.prototype.hasOwnProperty.call(project.speakers, nextName)) {
+      alert(`「${nextName}」は既に登録されています。別の話者名を入力してください。`);
+      return;
+    }
+
+    pushUndoEntry({
+      type: "speaker-rename",
+      project: cloneProjectForUndo(),
+      activeSectionId,
+      allSectionsVisible,
+      activeSpeakerFilter,
+    });
+    project.speakers = {
+      ...project.speakers,
+      [nextName]: { ...speaker, name: nextName },
+    };
+    delete project.speakers[name];
+    project.speakerOrder = project.speakerOrder.map((speakerName) => speakerName === name ? nextName : speakerName);
+    project.sections.forEach((section) => {
+      section.lines.forEach((line) => {
+        if (line.speaker === name) line.speaker = nextName;
+      });
+    });
+    if (activeSpeakerFilter === name) activeSpeakerFilter = nextName;
+    preserveEditorScroll(renderAll);
+    scheduleSave();
+  }
+
   function deleteSpeaker(name) {
     if (!project.speakers[name]) return;
     if (!confirm(`${name} を削除しますか？\n本文は残し、該当行の話者欄だけ空にします。`)) return;
@@ -2491,7 +3200,11 @@
       lines: [createLine()],
       notes: [],
     };
-    project.sections.push(section);
+    const activeIndex = allSectionsVisible
+      ? -1
+      : project.sections.findIndex((item) => item.id === activeSectionId);
+    const insertIndex = activeIndex >= 0 ? activeIndex + 1 : project.sections.length;
+    project.sections.splice(insertIndex, 0, section);
     activeSectionId = section.id;
     allSectionsVisible = false;
     project.activeSectionId = section.id;
@@ -2542,14 +3255,23 @@
     scheduleSave();
   }
 
-  function addLineAfter(index, parsedLines) {
+  function addLineAfter(index, parsedLines, focusField = "speaker") {
     const section = getActiveSection();
     const lines = parsedLines && parsedLines.length ? parsedLines : [createLine()];
+    const focusLineId = section.lines[index]?.id || "";
     section.lines.splice(index + 1, 0, ...lines);
+    pushUndoEntry({
+      type: "line-add",
+      sectionId: section.id,
+      index: index + 1,
+      lineIds: lines.map((line) => line.id),
+      focusLineId,
+      focusField,
+    });
     normalizeProject();
     renderAll();
     scheduleSave();
-    requestAnimationFrame(() => focusLine(index + 1, "speaker"));
+    requestAnimationFrame(() => focusLine(index + 1, focusField));
   }
 
   function deleteLine(index) {
@@ -2587,6 +3309,32 @@
     document.execCommand("insertText", false, text);
   }
 
+  function capturePasteUndo(target, index) {
+    const section = getActiveSection();
+    const line = section.lines[index];
+    if (!line) return null;
+    const isBody = target?.classList?.contains("body-input");
+    const storedBodySelection = bodySelection?.lineId === line.id ? bodySelection : null;
+    const bodyOffsets = isBody ? selectionOffsetsForEditor(target) || storedBodySelection : null;
+    const start = isBody ? bodyOffsets?.start : target?.selectionStart;
+    const end = isBody ? bodyOffsets?.end : target?.selectionEnd;
+    return {
+      project: cloneProjectForUndo(),
+      activeSectionId,
+      allSectionsVisible,
+      activeSpeakerFilter,
+      selectedLineIds: Array.from(selectedLineIds),
+      lineSelectionAnchorId,
+      focusedLineId,
+      focus: {
+        lineId: line.id,
+        field: isBody ? "body" : "speaker",
+        start: Number.isFinite(start) ? start : 0,
+        end: Number.isFinite(end) ? end : Number.isFinite(start) ? start : 0,
+      },
+    };
+  }
+
   function handlePaste(event, index) {
     const text = event.clipboardData?.getData("text");
     if (!text || !text.includes("\n")) return;
@@ -2596,11 +3344,13 @@
       .filter((line) => line.trim().length > 0)
       .map(parseRawLine);
     if (!pasted.length) return;
+    const undoEntry = capturePasteUndo(event.currentTarget, index);
     const section = getActiveSection();
     section.lines.splice(index, 1, ...pasted);
     normalizeProject();
     renderAll();
     scheduleSave();
+    pushPasteUndo(undoEntry);
   }
 
   function handleBodyPaste(event, index) {
@@ -2610,6 +3360,7 @@
       handlePaste(event, index);
       return;
     }
+    const undoEntry = capturePasteUndo(event.currentTarget, index);
     const richHtml = event.clipboardData?.getData("text/html") || "";
     if (richHtml) {
       const bodyHtml = sanitizeBodyClipboardHtml(richHtml);
@@ -2624,9 +3375,15 @@
           insertStyledBodyPaste(event.currentTarget, index, alignedClipboard.text, alignedClipboard.marks)
         ) {
           event.preventDefault();
+          pushPasteUndo(undoEntry);
           return;
         }
       }
+    }
+    if (insertStyledBodyPaste(event.currentTarget, index, text, [])) {
+      event.preventDefault();
+      pushPasteUndo(undoEntry);
+      return;
     }
     event.preventDefault();
     document.execCommand("insertText", false, text);
@@ -2748,14 +3505,38 @@
   }
 
   function handleRowKey(event, index, field) {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (undoPasteFromEditor(event)) return;
+    if (undoBlankAddedLineFromEditor(event)) return;
     if (event.key !== "Enter") return;
     event.preventDefault();
     if (field === "speaker") {
       const line = getActiveSection().lines[index];
       if (line) commitLineSpeaker(line);
     }
-    addLineAfter(index);
-    requestAnimationFrame(() => focusLine(index + 1, field));
+    addLineAfter(index, undefined, field);
+  }
+
+  function undoPasteFromEditor(event) {
+    if (!isUndoShortcut(event)) return false;
+    const latest = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
+    if (latest?.type !== "paste" || !canUndoLastAction()) return false;
+    event.preventDefault();
+    undoLastAction();
+    return true;
+  }
+
+  function undoBlankAddedLineFromEditor(event) {
+    if (!isUndoShortcut(event)) return false;
+    const latest = lineDeleteUndoStack[lineDeleteUndoStack.length - 1];
+    if (latest?.type !== "line-add") return false;
+    const lineId = event.currentTarget.closest(".script-row")?.dataset.lineId;
+    if (!lineId || !latest.lineIds?.includes(lineId)) return false;
+    const line = findLine(lineId);
+    if (!line || !isBlankLine(line)) return false;
+    event.preventDefault();
+    undoLastAction();
+    return true;
   }
 
   function commitLineSpeaker(line) {
@@ -2863,9 +3644,9 @@
     }
   }
 
-  function speakerCounts() {
+  function speakerCounts(sections = project.sections) {
     const counts = {};
-    project.sections.forEach((section) => {
+    sections.forEach((section) => {
       section.lines.forEach((line) => {
         if (!shouldAutoRegisterSpeaker(line)) return;
         counts[line.speaker] = (counts[line.speaker] || 0) + 1;
@@ -3091,53 +3872,215 @@
   async function saveJson() {
     syncProjectTitleFromInput();
     normalizeProject();
-    const data = JSON.stringify(projectForSave(), null, 2);
-    const fileName = `${safeFileName(project.title)}.json`;
-    if (window.showSaveFilePicker) {
-      const handle = await showJsonSaveFilePicker(fileName);
-      clearTimeout(jsonAutoSaveTimer);
-      jsonAutoSaveTimer = 0;
-      jsonAutoSaveQueued = false;
-      if (jsonAutoSavePromise) {
-        try {
-          await jsonAutoSavePromise;
-        } catch (_error) {
-          // 手動保存を続行するため、自動保存側の失敗はここでは無視します。
-        }
-      }
-      const writable = await handle.createWritable();
-      await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
-      await writable.close();
-      await rememberJsonSaveHandle(handle);
-      setSaveState(`JSON保存・自動保存先を設定済み: ${handle.name}`);
+    const currentHandle = await getRememberedJsonSaveHandle();
+    if (!currentHandle) {
+      await saveJsonAs();
       return;
     }
-    downloadBlob(data, fileName, "application/json");
-    setSaveState("JSON保存済み（このブラウザではJSON自動保存を利用できません）");
+    if (!(await requestHandleWritePermission(currentHandle))) return;
+    await saveJsonToHandle(currentHandle, currentHandle, false);
   }
 
-  async function showJsonSaveFilePicker(fileName) {
-    const rememberedHandle = await getRememberedJsonSaveHandle();
-    const options = {
-      id: JSON_SAVE_PICKER_ID,
-      suggestedName: fileName,
-      types: [
-        {
-          description: "JSONファイル",
-          accept: { "application/json": [".json"] },
-        },
-      ],
-    };
-    if (rememberedHandle) options.startIn = rememberedHandle;
+  async function saveJsonAs() {
+    syncProjectTitleFromInput();
+    normalizeProject();
+    const previousHandle = await getRememberedJsonSaveHandle();
+    const fileName = `${safeFileName(project.title)}.json`;
+
+    if (!window.showDirectoryPicker) {
+      const copy = projectForSave();
+      if (previousHandle) copy.projectId = createProjectId();
+      downloadBlob(JSON.stringify(copy, null, 2), fileName, "application/json");
+      setSaveState("JSONをダウンロードしました（自動保存先は変更されません）");
+      return;
+    }
+
+    const handle = await createNewJsonFileHandle(fileName, previousHandle);
+    if (!handle) return;
+    await saveJsonToHandle(handle, previousHandle, Boolean(previousHandle));
+  }
+
+  async function saveJsonToHandle(handle, previousHandle, isSaveAsNewProject) {
+    clearTimeout(jsonAutoSaveTimer);
+    jsonAutoSaveTimer = 0;
+    jsonAutoSaveQueued = false;
+    if (jsonAutoSavePromise) await jsonAutoSavePromise;
+
+    const targetCheck = await inspectJsonSaveTarget(handle);
+    const sameAsPreviousHandle = await areSameFileHandles(handle, previousHandle);
+    if (!(await approveManualJsonTarget(targetCheck, handle.name, previousHandle, sameAsPreviousHandle))) return;
+    if (!(await createManualBackupBeforeWrite(targetCheck, handle, previousHandle))) return;
+
+    if (isSaveAsNewProject) project.projectId = createProjectId();
+    const data = JSON.stringify(projectForSave(), null, 2);
+    await writeJsonToFileHandle(handle, data);
+    await rememberJsonSaveHandle(handle);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(projectForSave()));
+    loadedJsonSourceFingerprint = jsonDataFingerprint(projectForSave());
+    const savedFile = await handle.getFile();
+    loadedJsonSourceFileIdentity = fileIdentityFromFile(savedFile);
+    hasPendingSave = false;
+    scheduleProjectBackup();
+    setSaveState(
+      `${isSaveAsNewProject ? "別台本として保存・" : ""}JSON自動保存先を設定済み: ${handle.name}`,
+    );
+  }
+
+  async function requestHandleWritePermission(handle) {
+    const currentPermission = await queryHandleWritePermission(handle);
+    if (currentPermission === "granted") return true;
+    if (typeof handle?.requestPermission === "function") {
+      const permission = await handle.requestPermission({ mode: "readwrite" });
+      if (permission === "granted") return true;
+    }
+    setSaveState(`JSON自動保存の再設定が必要: ${handle?.name || "保存先"}`, { warning: "permission" });
+    alert("現在のJSONへ書き込む権限がありません。［別名保存］で新しいファイルを作成してください。");
+    return false;
+  }
+
+  async function createNewJsonFileHandle(suggestedName, previousHandle) {
+    const options = { id: JSON_SAVE_DIRECTORY_PICKER_ID, mode: "readwrite" };
+    if (previousHandle) options.startIn = previousHandle;
+
+    let directoryHandle;
+    try {
+      directoryHandle = await window.showDirectoryPicker(options);
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      // ブラウザが id や startIn を受け付けない場合は、最小構成で再試行します。
+      directoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+    }
+
+    const enteredName = prompt(
+      "新しく作成するJSONファイル名を入力してください。\n既存ファイルと同じ名前は使用できません。",
+      suggestedName,
+    );
+    if (enteredName === null) return null;
+    const fileName = normalizeJsonFileName(enteredName);
+    if (!fileName) {
+      alert("ファイル名を入力してください。");
+      return null;
+    }
 
     try {
-      return await window.showSaveFilePicker(options);
+      await directoryHandle.getFileHandle(fileName);
+      setSaveState("上書きを防止しました（同名ファイルが既にあります）", { warning: "overwrite-blocked" });
+      alert(`「${fileName}」は既に存在します。既存ファイルは上書きできません。別の名前を指定してください。`);
+      return null;
     } catch (error) {
-      if (!rememberedHandle || error?.name === "AbortError") throw error;
-      await forgetRememberedJsonSaveHandle();
-      delete options.startIn;
-      return window.showSaveFilePicker(options);
+      if (error?.name !== "NotFoundError") throw error;
     }
+    return directoryHandle.getFileHandle(fileName, { create: true });
+  }
+
+  function normalizeJsonFileName(value) {
+    const entered = String(value || "").trim();
+    if (!entered) return "";
+    const withoutExtension = entered.replace(/\.json$/i, "");
+    return `${safeFileName(withoutExtension)}.json`;
+  }
+
+  async function inspectJsonSaveTarget(handle) {
+    const file = await handle.getFile();
+    const fileIdentity = { name: file.name, size: file.size, lastModified: file.lastModified };
+    if (!file.size) return { status: "empty", data: null, fileIdentity };
+
+    let raw;
+    try {
+      raw = JSON.parse(await file.text());
+    } catch (_error) {
+      return { status: "invalid", data: null, fileIdentity };
+    }
+    if (!raw || !Array.isArray(raw.sections)) return { status: "invalid", data: raw, fileIdentity };
+
+    const targetProjectId = typeof raw.projectId === "string" ? raw.projectId.trim() : "";
+    if (!targetProjectId) {
+      return {
+        status: "legacy",
+        data: raw,
+        title: cleanProjectTitle(raw.title) || "無題の台本",
+        fingerprint: jsonDataFingerprint(raw),
+        fileIdentity,
+      };
+    }
+    if (targetProjectId !== project.projectId) {
+      return {
+        status: "different-project",
+        data: raw,
+        title: cleanProjectTitle(raw.title) || "無題の台本",
+        projectId: targetProjectId,
+        fingerprint: jsonDataFingerprint(raw),
+        fileIdentity,
+      };
+    }
+    return {
+      status: "same-project",
+      data: raw,
+      title: cleanProjectTitle(raw.title) || "無題の台本",
+      fingerprint: jsonDataFingerprint(raw),
+      fileIdentity,
+    };
+  }
+
+  async function approveManualJsonTarget(targetCheck, fileName, previousHandle, sameAsPreviousHandle) {
+    if (targetCheck.status === "empty") return true;
+    if (previousHandle && !sameAsPreviousHandle) {
+      setSaveState("上書きを防止しました（現在の保存先とは別の既存ファイルです）", { warning: "overwrite-blocked" });
+      alert(
+        `「${fileName}」は現在の自動保存先とは別の既存ファイルです。\n\n` +
+          "台本IDが同じでも上書きは中止しました。別のファイル名で保存してください。",
+      );
+      return false;
+    }
+    if (targetCheck.status === "different-project") {
+      setSaveState("上書きを防止しました（別の台本ファイルです）", { warning: "overwrite-blocked" });
+      alert(
+        `「${fileName}」は別の台本「${targetCheck.title}」の保存ファイルです。\n\n` +
+          "上書きは中止しました。現在の台本は別名で保存してください。",
+      );
+      return false;
+    }
+    if (targetCheck.status === "invalid") {
+      setSaveState("上書きを防止しました（台本JSONではありません）", { warning: "overwrite-blocked" });
+      alert(`「${fileName}」は台本エディタのJSONとして確認できないため、上書きを中止しました。`);
+      return false;
+    }
+
+    const isLoadedSource =
+      Boolean(loadedJsonSourceFingerprint) &&
+      targetCheck.fingerprint === loadedJsonSourceFingerprint &&
+      sameFileIdentity(targetCheck.fileIdentity, loadedJsonSourceFileIdentity);
+    if (targetCheck.status === "same-project") {
+      if (sameAsPreviousHandle || (!previousHandle && isLoadedSource)) return true;
+      setSaveState("上書きを防止しました（読み込んだ元ファイルとして確認できません）", { warning: "overwrite-blocked" });
+      alert(
+        `「${fileName}」は現在の保存先または読み込んだ元ファイルとして確認できないため、上書きを中止しました。`,
+      );
+      return false;
+    }
+
+    if (!sameAsPreviousHandle && !isLoadedSource) {
+      setSaveState("上書きを防止しました（旧形式の別ファイルです）", { warning: "overwrite-blocked" });
+      alert(
+        `「${fileName}」は識別IDがない既存ファイルで、読み込んだ元ファイルとも一致しません。\n\n` +
+          "上書きは中止しました。別のファイル名で保存してください。",
+      );
+      return false;
+    }
+
+    const approved = confirm(
+      `「${fileName}」は識別IDがない旧形式の台本「${targetCheck.title}」です。\n\n` +
+        `現在の台本「${project.title}」の保存先として登録し、上書きしますか？\n` +
+        "別の台本かもしれない場合は［キャンセル］してください。",
+    );
+    if (!approved) setSaveState("旧形式JSONへの上書きを中止しました");
+    return approved;
+  }
+
+  async function writeJsonToFileHandle(handle, data) {
+    const writable = await handle.createWritable();
+    await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
+    await writable.close();
   }
 
   async function getRememberedJsonSaveHandle() {
@@ -3184,11 +4127,242 @@
     jsonAutoSaveQueued = false;
     lastJsonSaveHandle = null;
     lastJsonSaveHandleLoaded = true;
+    setSaveState("JSON自動保存先は未設定です", { notify: false });
     try {
       await deleteFileHandle(JSON_SAVE_HANDLE_KEY);
     } catch (error) {
       console.warn("古いJSON保存先を削除できませんでした。", error);
     }
+  }
+
+  async function getRememberedBackupDirectoryHandle() {
+    if (backupDirectoryHandleLoaded) return backupDirectoryHandle;
+    if (!backupDirectoryHandleLoadPromise) {
+      backupDirectoryHandleLoadPromise = readFileHandle(BACKUP_DIRECTORY_HANDLE_KEY)
+        .then((handle) => {
+          if (!backupDirectoryHandleLoaded) {
+            backupDirectoryHandle = handle;
+            backupDirectoryHandleLoaded = true;
+          }
+          return backupDirectoryHandle;
+        })
+        .catch((error) => {
+          console.warn("バックアップフォルダを読み込めませんでした。", error);
+          if (!backupDirectoryHandleLoaded) {
+            backupDirectoryHandle = null;
+            backupDirectoryHandleLoaded = true;
+          }
+          return backupDirectoryHandle;
+        })
+        .finally(() => {
+          backupDirectoryHandleLoadPromise = null;
+        });
+    }
+    return backupDirectoryHandleLoadPromise;
+  }
+
+  async function rememberBackupDirectoryHandle(handle) {
+    backupDirectoryHandle = handle;
+    backupDirectoryHandleLoaded = true;
+    try {
+      await writeFileHandle(BACKUP_DIRECTORY_HANDLE_KEY, handle);
+    } catch (error) {
+      console.warn("バックアップフォルダを永続化できませんでした。", error);
+    }
+  }
+
+  async function chooseBackupDirectory() {
+    if (!window.showDirectoryPicker) {
+      alert("このブラウザはフォルダへの自動バックアップに対応していません。ChromeまたはEdgeで開いてください。");
+      return;
+    }
+
+    const rememberedHandle = await getRememberedBackupDirectoryHandle();
+    if (rememberedHandle && typeof rememberedHandle.requestPermission === "function") {
+      const currentPermission = await queryHandleWritePermission(rememberedHandle);
+      if (currentPermission !== "granted") {
+        const permission = await rememberedHandle.requestPermission({ mode: "readwrite" });
+        if (permission === "granted") {
+          setBackupState(`バックアップ先: ${rememberedHandle.name}（10分ごと・最大30世代）`, { notify: true });
+          const result = await createProjectBackup({ force: true, reason: "再設定時" });
+          if (result.status !== "saved") throw new Error("再設定後のバックアップを作成できませんでした。");
+          return;
+        }
+      }
+    }
+
+    const handle = await window.showDirectoryPicker({ id: "script-editor-json-backups", mode: "readwrite" });
+    await rememberBackupDirectoryHandle(handle);
+    setBackupState(`バックアップ先: ${handle.name}（10分ごと・最大30世代）`, { notify: true });
+    const result = await createProjectBackup({ force: true, reason: "設定時" });
+    if (result.status !== "saved") throw new Error("初回バックアップを作成できませんでした。");
+  }
+
+  async function showRememberedBackupState() {
+    try {
+      const handle = await getRememberedBackupDirectoryHandle();
+      if (!handle) {
+        setBackupState("バックアップ未設定");
+        return;
+      }
+      const permission = await queryHandleWritePermission(handle);
+      if (permission !== "granted") {
+        setBackupState(`バックアップの再設定が必要: ${handle.name}`, { warning: "permission", notify: true });
+        return;
+      }
+      setBackupState(`バックアップ先: ${handle.name}（10分ごと・最大30世代）`);
+    } catch (error) {
+      console.warn("バックアップ先の状態を確認できませんでした。", error);
+      setBackupState("バックアップ先を確認できませんでした", { warning: "unavailable", notify: true });
+    }
+  }
+
+  async function queryHandleWritePermission(handle) {
+    if (typeof handle?.queryPermission !== "function") return "granted";
+    return handle.queryPermission({ mode: "readwrite" });
+  }
+
+  async function createManualBackupBeforeWrite(targetCheck, handle, previousHandle) {
+    const directoryHandle = await getRememberedBackupDirectoryHandle();
+    if (!directoryHandle) {
+      setBackupState("バックアップ未設定（必要なら先に設定してください）");
+      return true;
+    }
+
+    const backupRequests = [];
+    if (targetCheck.data) {
+      backupRequests.push({ data: targetCheck.data, reason: "上書き前" });
+    }
+    if (!(await areSameFileHandles(handle, previousHandle))) {
+      backupRequests.push({ data: projectForSave(), reason: "保存先変更前" });
+    }
+    if (!backupRequests.length) backupRequests.push({ data: projectForSave(), reason: "手動保存前" });
+
+    for (const request of backupRequests) {
+      const result = await createProjectBackup({ data: request.data, force: true, reason: request.reason });
+      if (result.status === "saved") continue;
+      return confirm(
+        "世代バックアップを作成できませんでした。\n\n" +
+          "バックアップなしでJSON保存を続けますか？\n安全のため、通常は［キャンセル］してバックアップ設定を確認してください。",
+      );
+    }
+    return true;
+  }
+
+  async function areSameFileHandles(first, second) {
+    if (!first || !second) return false;
+    if (first === second) return true;
+    if (typeof first.isSameEntry !== "function") return false;
+    try {
+      return await first.isSameEntry(second);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function scheduleProjectBackup() {
+    clearTimeout(backupTimer);
+    const lastSavedAt = readLastBackupTime(project.projectId);
+    const delay = Math.max(0, BACKUP_INTERVAL - (Date.now() - lastSavedAt));
+    backupTimer = window.setTimeout(() => {
+      backupTimer = 0;
+      createProjectBackup({ reason: "自動" }).catch((error) => {
+        console.warn("世代バックアップを作成できませんでした。", error);
+        setBackupState("バックアップに失敗しました（JSON自動保存は継続中）", { warning: "failed", notify: true });
+      });
+    }, delay);
+  }
+
+  async function createProjectBackup({ data = projectForSave(), force = false, reason = "自動" } = {}) {
+    const snapshot = JSON.parse(JSON.stringify(data));
+    const projectId = project.projectId;
+    const projectTitle = cleanProjectTitle(snapshot.title) || project.title || "無題の台本";
+    if (!force && Date.now() - readLastBackupTime(projectId) < BACKUP_INTERVAL) {
+      return { status: "not-due" };
+    }
+
+    const directoryHandle = await getRememberedBackupDirectoryHandle();
+    if (!directoryHandle) return { status: "no-target" };
+    const permission = await queryHandleWritePermission(directoryHandle);
+    if (permission !== "granted") {
+      setBackupState(`バックアップの再設定が必要: ${directoryHandle.name}`, { warning: "permission", notify: true });
+      return { status: "permission-required" };
+    }
+
+    const dataText = JSON.stringify(snapshot, null, 2);
+    const writeTask = backupWriteChain
+      .catch(() => undefined)
+      .then(() => writeProjectBackup(directoryHandle, projectId, projectTitle, reason, dataText));
+    backupWriteChain = writeTask.catch(() => undefined);
+    try {
+      return await writeTask;
+    } catch (error) {
+      console.warn("世代バックアップを作成できませんでした。", error);
+      setBackupState("バックアップに失敗しました（JSON自動保存は継続中）", { warning: "failed", notify: true });
+      return { status: "failed", error };
+    }
+  }
+
+  async function writeProjectBackup(directoryHandle, projectId, projectTitle, reason, dataText) {
+    const prefix = backupFilePrefix(projectId);
+    const timestamp = formatBackupTimestamp(new Date());
+    const fileName = `${prefix}${timestamp}_${safeFileName(reason).slice(0, 20)}_${safeFileName(projectTitle)}.json`;
+    const fileHandle = await directoryHandle.getFileHandle(fileName, { create: true });
+    await writeJsonToFileHandle(fileHandle, dataText);
+    const savedAt = Date.now();
+    localStorage.setItem(backupLastSavedKey(projectId), String(savedAt));
+
+    let backupCount = 1;
+    try {
+      backupCount = await trimProjectBackups(directoryHandle, prefix);
+    } catch (error) {
+      console.warn("古い世代バックアップを整理できませんでした。", error);
+    }
+    if (project.projectId === projectId) {
+      setBackupState(
+        `バックアップ済み ${new Date(savedAt).toLocaleTimeString("ja-JP")}（${backupCount}/${BACKUP_MAX_FILES}世代）`,
+      );
+    }
+    return { status: "saved", fileName };
+  }
+
+  async function trimProjectBackups(directoryHandle, prefix) {
+    const names = [];
+    for await (const [name, handle] of directoryHandle.entries()) {
+      if (handle.kind === "file" && name.startsWith(prefix) && name.endsWith(".json")) names.push(name);
+    }
+    names.sort();
+    const removeNames = names.slice(0, Math.max(0, names.length - BACKUP_MAX_FILES));
+    for (const name of removeNames) await directoryHandle.removeEntry(name);
+    return names.length - removeNames.length;
+  }
+
+  function backupFilePrefix(projectId) {
+    const safeProjectId = String(projectId || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+    return `台本バックアップ_${safeProjectId}_`;
+  }
+
+  function formatBackupTimestamp(date) {
+    const parts = [
+      date.getFullYear(),
+      String(date.getMonth() + 1).padStart(2, "0"),
+      String(date.getDate()).padStart(2, "0"),
+      "-",
+      String(date.getHours()).padStart(2, "0"),
+      String(date.getMinutes()).padStart(2, "0"),
+      String(date.getSeconds()).padStart(2, "0"),
+      String(date.getMilliseconds()).padStart(3, "0"),
+    ];
+    return parts.join("");
+  }
+
+  function backupLastSavedKey(projectId) {
+    return `${BACKUP_LAST_SAVED_KEY_PREFIX}${projectId}`;
+  }
+
+  function readLastBackupTime(projectId) {
+    const value = Number(localStorage.getItem(backupLastSavedKey(projectId)));
+    return Number.isFinite(value) && value > 0 ? value : 0;
   }
 
   function openFileHandleDatabase() {
@@ -3255,32 +4429,72 @@
     }
   }
 
+  async function chooseJsonFileToLoad() {
+    if (!window.showOpenFilePicker) {
+      els.loadJsonInput.click();
+      return;
+    }
+
+    const options = {
+      id: "script-editor-json-open",
+      multiple: false,
+      types: [
+        {
+          description: "JSONファイル",
+          accept: { "application/json": [".json"] },
+        },
+      ],
+    };
+    const currentHandle = await getRememberedJsonSaveHandle();
+    if (currentHandle) options.startIn = currentHandle;
+
+    const [handle] = await window.showOpenFilePicker(options);
+    if (!handle) return;
+    const file = await handle.getFile();
+    if (typeof handle.requestPermission === "function") {
+      const permission = await queryHandleWritePermission(handle);
+      if (permission !== "granted") await handle.requestPermission({ mode: "readwrite" });
+    }
+    await loadJsonProject(file, handle);
+  }
+
   function loadJsonFile(event) {
     const file = event.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        project = hydrateProject(JSON.parse(String(reader.result)));
-        activeSectionId = project.activeSectionId || project.sections[0].id;
-        allSectionsVisible = false;
-        activeSpeakerFilter = "";
-        selectedLineIds.clear();
-        lineSelectionAnchorId = "";
-        lineDeleteUndoStack = [];
-        focusedLineId = "";
-        forgetRememberedJsonSaveHandle();
-        normalizeProject();
-        renderAll();
-        scheduleSave();
-      } catch (error) {
+    loadJsonProject(file, null)
+      .catch((error) => {
         alert("JSONを読み込めませんでした。");
         console.error(error);
-      } finally {
+      })
+      .finally(() => {
         els.loadJsonInput.value = "";
-      }
-    };
-    reader.readAsText(file, "utf-8");
+      });
+  }
+
+  async function loadJsonProject(file, fileHandle) {
+    const rawProject = JSON.parse(await file.text());
+    const nextProject = hydrateProject(rawProject);
+    const nextSourceFingerprint = jsonDataFingerprint(rawProject);
+    if (!(await saveCurrentProjectBeforeSwitch())) return;
+
+    clearTimeout(backupTimer);
+    backupTimer = 0;
+    project = nextProject;
+    loadedJsonSourceFingerprint = nextSourceFingerprint;
+    loadedJsonSourceFileIdentity = fileIdentityFromFile(file);
+    activeSectionId = project.activeSectionId || project.sections[0].id;
+    allSectionsVisible = false;
+    activeSpeakerFilter = "";
+    selectedLineIds.clear();
+    lineSelectionAnchorId = "";
+    lineDeleteUndoStack = [];
+    focusedLineId = "";
+
+    await forgetRememberedJsonSaveHandle();
+    if (fileHandle) await rememberJsonSaveHandle(fileHandle);
+    normalizeProject();
+    renderAll();
+    scheduleSave();
   }
 
   function exportTxt() {
@@ -3306,7 +4520,8 @@
   }
 
   function formatScriptLinePlainText(line) {
-    return line.speaker ? `${line.speaker}：${line.body}` : line.body;
+    const body = textWithFurigana(line.body);
+    return line.speaker ? `${line.speaker}：${body}` : body;
   }
 
   function formatNotePlainText(note, bounds) {
@@ -3548,14 +4763,14 @@
       const includeSectionTitles = project.sections.length > 1;
       const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
       const sectionTexts = lines.map((group) => {
-        const body = group.lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body)).join(lineSeparator);
+        const body = group.lines.map(formatScriptLinePlainText).join(lineSeparator);
         return includeSectionTitles ? `${group.title}\n${body}` : body;
       });
       return sectionTexts.join("\n\n");
     }
     if (Array.isArray(lines)) {
       const lineSeparator = project.settings.exportBlankLineBetweenLines ? "\n\n" : "\n";
-      return lines.map((line) => (line.speaker ? `${line.speaker}：${line.body}` : line.body)).join(lineSeparator);
+      return lines.map(formatScriptLinePlainText).join(lineSeparator);
     }
     return buildGoogleDocsPastePlainTextForSections(project.sections);
   }
@@ -3628,7 +4843,7 @@
   }
 
   function bodyPasteHtml(line) {
-    const runs = styledTextRuns(line.body, line.bodyMarks);
+    const runs = styledTextRunsWithFurigana(line.body, line.bodyMarks);
     if (!runs.length) return "";
     const defaultColor = normalizeCssColor(getSpeakerBodyColor(project.speakers[line.speaker]));
     return runs.map((run) => {
@@ -3728,7 +4943,7 @@
         }
         if (line.body) {
           const bodyColor = normalizeCssColor(getSpeakerBodyColor(project.speakers[line.speaker]));
-          styledTextRuns(line.body, line.bodyMarks).forEach((run) => {
+          styledTextRunsWithFurigana(line.body, line.bodyMarks).forEach((run) => {
             runs.push({
               text: run.text,
               bold: run.bold,
@@ -4043,10 +5258,11 @@
   }
 
   function scheduleSave() {
-    setSaveState("保存中...");
-    hasPendingSave = false;
+    setSaveState("保存中...", { notify: false, preserveWarning: true });
+    hasPendingSave = true;
     clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
+      saveTimer = 0;
       saveProjectNow();
     }, 250);
   }
@@ -4054,7 +5270,7 @@
   function markSavePending() {
     clearTimeout(saveTimer);
     hasPendingSave = true;
-    setSaveState("未保存の入力があります");
+    setSaveState("未保存の入力があります", { notify: false, preserveWarning: true });
   }
 
   function flushPendingSave() {
@@ -4070,12 +5286,15 @@
   }
 
   function saveProjectNow() {
+    clearTimeout(saveTimer);
+    saveTimer = 0;
     project.updatedAt = new Date().toISOString();
     project.activeSectionId = activeSectionId;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(projectForSave()));
     hasPendingSave = false;
-    setSaveState(`LocalStorageに自動保存済み ${new Date().toLocaleTimeString("ja-JP")}`);
+    setSaveState(`LocalStorageに自動保存済み ${new Date().toLocaleTimeString("ja-JP")}`, { notify: false, preserveWarning: true });
     scheduleJsonAutoSave();
+    scheduleProjectBackup();
   }
 
   function scheduleJsonAutoSave(delay = JSON_AUTO_SAVE_DELAY) {
@@ -4097,10 +5316,11 @@
       .catch((error) => {
         console.warn("JSONを自動保存できませんでした。", error);
         if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
-          setSaveState("LocalStorageに保存済み（JSON自動保存の再設定が必要です）");
-          return;
+          setSaveState("LocalStorageに保存済み（JSON自動保存の再設定が必要です）", { warning: "permission" });
+          return { status: "permission-required" };
         }
-        setSaveState("JSON自動保存に失敗しました（LocalStorageには保存済みです）");
+        setSaveState("JSON自動保存に失敗しました（LocalStorageには保存済みです）", { warning: "failed" });
+        return { status: "failed" };
       })
       .finally(() => {
         jsonAutoSaveRunning = false;
@@ -4115,23 +5335,66 @@
   async function performJsonAutoSave() {
     const targetVersion = jsonAutoSaveTargetVersion;
     const handle = await getRememberedJsonSaveHandle();
-    if (!handle) return;
+    if (!handle) return { status: "no-target" };
 
     if (typeof handle.queryPermission === "function") {
       const permission = await handle.queryPermission({ mode: "readwrite" });
       if (permission !== "granted") {
-        setSaveState(`LocalStorageに保存済み（JSON自動保存の再設定が必要: ${handle.name}）`);
-        return;
+        setSaveState(`LocalStorageに保存済み（JSON自動保存の再設定が必要: ${handle.name}）`, { warning: "permission" });
+        return { status: "permission-required" };
       }
     }
 
-    if (targetVersion !== jsonAutoSaveTargetVersion) return;
+    if (targetVersion !== jsonAutoSaveTargetVersion) return { status: "target-changed" };
+    const targetCheck = await inspectJsonSaveTarget(handle);
+    if (targetCheck.status === "different-project") {
+      setSaveState(`上書き防止: ${handle.name} は別の台本です（JSON保存で保存先を変更してください）`, { warning: "different-project" });
+      return { status: "different-project" };
+    }
+    if (targetCheck.status === "legacy") {
+      setSaveState(`旧形式JSONの確認が必要: ${handle.name}（JSON保存を押してください）`, { warning: "legacy-target" });
+      return { status: "legacy-target" };
+    }
+    if (targetCheck.status === "invalid") {
+      setSaveState(`上書き防止: ${handle.name} は台本JSONとして確認できません`, { warning: "invalid-target" });
+      return { status: "invalid-target" };
+    }
     const data = JSON.stringify(projectForSave(), null, 2);
-    const writable = await handle.createWritable();
-    await writable.write(new Blob([data], { type: "application/json;charset=utf-8" }));
-    await writable.close();
-    if (targetVersion !== jsonAutoSaveTargetVersion) return;
-    setSaveState(`LocalStorage・JSONに自動保存済み ${new Date().toLocaleTimeString("ja-JP")} : ${handle.name}`);
+    await writeJsonToFileHandle(handle, data);
+    if (targetVersion !== jsonAutoSaveTargetVersion) return { status: "target-changed" };
+    setSaveState(`LocalStorage・JSONに自動保存済み ${new Date().toLocaleTimeString("ja-JP")} : ${handle.name}`, { notify: false });
+    return { status: "saved" };
+  }
+
+  async function saveCurrentProjectBeforeSwitch() {
+    while (true) {
+      if (hasPendingSave) saveProjectNow();
+
+      clearTimeout(jsonAutoSaveTimer);
+      jsonAutoSaveTimer = 0;
+      if (jsonAutoSavePromise) await jsonAutoSavePromise;
+
+      // 直前の保存中に追加の変更が入った場合も、最新状態でもう一度保存します。
+      clearTimeout(jsonAutoSaveTimer);
+      jsonAutoSaveTimer = 0;
+      jsonAutoSaveQueued = false;
+      const result = await startJsonAutoSave();
+      if (hasPendingSave || saveTimer || jsonAutoSaveQueued || jsonAutoSaveTimer) continue;
+      if (result?.status === "saved") {
+        const backupResult = await createProjectBackup({ force: true, reason: "台本切替前" });
+        if (backupResult.status === "saved" || backupResult.status === "no-target") return true;
+        return confirm(
+          "JSONは保存できましたが、切り替え前バックアップを作成できませんでした。\n\n" +
+            "バックアップなしで切り替えますか？",
+        );
+      }
+      if (result?.status === "no-target") {
+        return confirm("現在の内容にはJSON自動保存先がありません。JSON保存せずに切り替えますか？");
+      }
+
+      alert("JSON自動保存を完了できないため、切り替えを中止しました。先に「JSON保存」で保存先を再設定してください。");
+      return false;
+    }
   }
 
   async function showRememberedJsonAutoSaveState() {
@@ -4143,12 +5406,12 @@
       if (typeof handle.queryPermission === "function") {
         const permission = await handle.queryPermission({ mode: "readwrite" });
         if (permission !== "granted") {
-          setSaveState(`LocalStorageに自動保存済み（JSON自動保存の再設定が必要: ${handle.name}）`);
+          setSaveState(`LocalStorageに自動保存済み（JSON自動保存の再設定が必要: ${handle.name}）`, { warning: "permission" });
           return;
         }
       }
       if (targetVersion !== jsonAutoSaveTargetVersion) return;
-      setSaveState(`LocalStorageに自動保存済み / JSON自動保存先: ${handle.name}`);
+      setSaveState(`LocalStorageに自動保存済み / JSON自動保存先: ${handle.name}`, { notify: false });
       scheduleJsonAutoSave(0);
     } catch (error) {
       console.warn("JSON自動保存先の状態を確認できませんでした。", error);
@@ -4176,13 +5439,79 @@
     }, 120);
   }
 
-  function setSaveState(text) {
-    if (!els.saveState) return;
-    els.saveState.textContent = text;
+  function setSaveState(text, options = {}) {
+    updateStatusNotice(els.saveState, els.saveJsonButton, text, options);
+  }
+
+  function setBackupState(text, options = {}) {
+    updateStatusNotice(els.backupState, els.backupSettingsButton, text, { notify: false, ...options });
+  }
+
+  function updateStatusNotice(notice, button, text, { notify = true, warning = "", preserveWarning = false } = {}) {
+    if (!notice || !button) return;
+    const previousWarning = button.dataset.statusWarning || "";
+    // LocalStorageへの保存だけでは、JSON保存先の問題は解消しない。
+    if (preserveWarning && previousWarning) return;
+
+    if (!button.dataset.defaultTitle) button.dataset.defaultTitle = button.title;
+    button.title = `${button.dataset.defaultTitle}\n${text}`;
+    button.setAttribute("aria-description", text);
+    button.dataset.statusWarning = warning;
+    button.classList.toggle("status-warning", Boolean(warning));
+
+    if (!notify || (warning && warning === previousWarning)) {
+      if (previousWarning && !warning) {
+        clearTimeout(statusNoticeTimers.get(notice));
+        notice.hidden = true;
+      }
+      return;
+    }
+
+    clearTimeout(statusNoticeTimers.get(notice));
+    notice.textContent = text;
+    notice.dataset.warning = String(Boolean(warning));
+    notice.hidden = false;
+    statusNoticeTimers.set(notice, window.setTimeout(() => {
+      notice.hidden = true;
+      statusNoticeTimers.delete(notice);
+    }, STATUS_NOTICE_DURATION));
   }
 
   function makeId(prefix) {
     return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  function createProjectId() {
+    if (typeof window.crypto?.randomUUID === "function") return `project-${window.crypto.randomUUID()}`;
+    return makeId("project");
+  }
+
+  function jsonDataFingerprint(value) {
+    try {
+      return JSON.stringify(value);
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function fileIdentityFromFile(file) {
+    if (!file) return null;
+    return { name: file.name, size: file.size, lastModified: file.lastModified };
+  }
+
+  function sameFileIdentity(first, second) {
+    if (!first || !second) return false;
+    return (
+      first.name === second.name &&
+      Number(first.size) === Number(second.size) &&
+      Number(first.lastModified) === Number(second.lastModified)
+    );
+  }
+
+  function fileOperationErrorDetail(error) {
+    const name = error?.name || "Error";
+    const message = error?.message || "ブラウザがファイル操作を拒否しました。";
+    return `${name}: ${message}`;
   }
 
   function autoColor(name) {
